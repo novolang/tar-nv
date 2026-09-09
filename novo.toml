@@ -1,0 +1,42 @@
+[package]
+name        = "tar-nv"
+version     = "0.0.1"
+description = "USTAR and PAX tar archives as arithmetic over 512-byte blocks, with no filesystem anywhere: a header value with every field typed rather than a blob, a feed-and-drain reader that emits events so an archive larger than memory still streams, a writer that returns blocks, PAX extended records for the paths and sizes USTAR cannot hold, POSIX's checksum rule, and the two-zero-block end."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and this one is easy: tar has no compression, no index and no
+# framing beyond the number 512.  Every function here is integer
+# arithmetic over bytes the caller already holds, and paths and modes
+# are values a caller supplies rather than anything read from a disk.
+# The half that touches a filesystem is `archive-nv`, which depends on
+# this and declares its own effects.  The one function that takes a
+# stream stays inside the budget by BINDING its cost rather than
+# spending one: `tarread.read_all<S: Read[e]>(…) -> … [e]` is charged
+# whatever the caller's impl supplies (SPEC § 5.6).
+layer       = "core"
+
+category    = "compression"
+
+tags        = ["tar", "ustar", "pax", "archive", "posix", "sans-io", "tarball"]
+repository  = "https://github.com/novolang/tar-nv"
+maintainers = ["novo-lang"]
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Reading and writing tar archives without a filesystem"
+
+[dependencies]
+# None.  tar carries no compression of its own — `.tar.gz` is this
+# package's output run through flate-nv, which is a composition a
+# caller makes and not a dependency this package needs.  Keeping them
+# apart is what lets a caller who only needs `.tar` avoid a DEFLATE
+# implementation entirely.

@@ -1,0 +1,108 @@
+// tarread_tests.nv — the API suite for the reader, which is this
+// package's load-bearing interface.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See tar_tests.nv for why
+// an interface package ships a failing suite.
+//
+// These assert the CONTRACT: that a fresh reader is clean, that an
+// empty chunk is not an end of stream, that a truncated archive is a
+// failure rather than a short one, and — the assertion this whole
+// design exists for — that `read_all` is charged whatever its source
+// costs and nothing more.  The tests calling it over a `Buffer`, whose
+// `impl Read[]` is empty, need `[io]` for their own `println` and
+// nothing for the read; if `read_all` ever grew a concrete effect they
+// would stop compiling here rather than at a consumer's.
+
+use std.test
+use tar
+use tarread
+use tarerror
+
+@test
+fn test_a_fresh_reader_is_clean() [io]
+    test.case("nothing consumed, no entries, no failure, not done")
+    let r = tarread.reader()
+    test.assert(tarread.total_in(r) == 0)
+    test.assert(tarread.entries_seen(r) == 0)
+    test.assert(tarread.is_done(r) == false)
+    match tarread.error(r)
+        None    => test.assert(true)
+        Some(_) => test.fail("a fresh reader is already failed")
+
+@test
+fn test_an_empty_chunk_reveals_nothing() [io]
+    test.case("and is not an end-of-stream signal")
+    let (r2, evs) = tarread.feed(tarread.reader(), bytes.from_str(""))
+    test.assert(list.len(evs) == 0)
+    test.assert(tarread.is_done(r2) == false)
+
+@test
+fn test_finishing_an_empty_archive_is_truncation() [io]
+    test.case("an archive with no zero blocks never ended")
+    match tarread.finish(tarread.reader())
+        Ok(_)                   => test.fail("an empty input read as a complete archive")
+        Err(UnexpectedEnd(off)) => test.assert(off == 0)
+        Err(_)                  => test.fail("refused for the wrong reason")
+
+@test
+fn test_the_two_zero_blocks_end_the_archive() [io]
+    test.case("feeding exactly the end-of-archive marker completes it")
+    let (r2, evs) = tarread.feed(tarread.reader(), tar.end_of_archive())
+    test.assert(list.len(evs) == 1)
+    test.assert(tarread.is_done(r2))
+
+@test
+fn test_an_ended_archive_finishes_cleanly() [io]
+    test.case("and finish adds nothing after TarArchiveDone")
+    let (r2, _) = tarread.feed(tarread.reader(), tar.end_of_archive())
+    match tarread.finish(r2)
+        Ok(evs) => test.assert(list.len(evs) == 0)
+        Err(_)  => test.fail("a properly ended archive was called truncated")
+
+@test
+fn test_one_zero_block_is_not_an_end() [io]
+    test.case("POSIX asks for two, and one is a truncated archive")
+    let one = bytes.slice(tar.end_of_archive(), 0, 512)
+    let (r2, _) = tarread.feed(tarread.reader(), one)
+    test.assert(tarread.is_done(r2) == false)
+
+@test
+fn test_a_block_that_is_not_a_header_is_named_as_such() [io]
+    test.case("512 bytes of text is not a tar header")
+    match tarread.list(bytes.from_str("this is not a tar archive"))
+        Ok(_)  => test.fail("plain text read as an archive")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_fresh_readers_format_is_a_default_not_a_claim() [io]
+    test.case("nothing has been read yet")
+    test.assert(tar.format_name(tarread.reader_format(tarread.reader())) == "pax")
+
+@test
+fn test_read_all_over_a_buffer_costs_nothing() [io]
+    test.case("an in-memory source charges the caller no effects")
+    // `Buffer`'s `impl Read[]` supplies an empty row, so this call
+    // adds nothing to this function's `[io]` — which is the whole
+    // claim the signature makes.
+    match tarread.read_all(Buffer.from_str(""))
+        Ok(_)  => test.fail("an empty buffer read as a complete archive")
+        Err(_) => test.assert(true)
+
+@test
+fn test_read_all_agrees_with_list_on_the_same_bytes() [io]
+    test.case("the pump inside is the same machine as the pump outside")
+    let text = "not an archive"
+    match tarread.read_all(Buffer.from_str(text))
+        Ok(_)  => match tarread.list(bytes.from_str(text))
+            Ok(_)  => test.assert(true)
+            Err(_) => test.fail("the streaming form accepted what the one-shot form refused")
+        Err(_) => match tarread.list(bytes.from_str(text))
+            Ok(_)  => test.fail("the one-shot form accepted what the streaming form refused")
+            Err(_) => test.assert(true)
+
+@test
+fn test_a_transport_failure_has_no_position() [io]
+    test.case("the stream failed before a block was reached")
+    test.assert(tarerror.block_of(TarSourceFailed(IoNotFound)) == -1)
+    test.assert(tarerror.byte_of(TarSourceFailed(IoNotFound)) == -1)
+    test.assert(tarerror.is_recoverable(TarSourceFailed(IoNotFound)) == false)

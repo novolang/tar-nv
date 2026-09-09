@@ -1,0 +1,75 @@
+// tar_tests.nv — the API suite for the block arithmetic.
+//
+// RED ON PURPOSE.  Every body in this package is a `todo()`, so every
+// assertion below reaches `not implemented: tar-nv.<fn>` and the suite
+// fails.  That is the expected state of an interface package and it is
+// what makes these tests worth writing NOW: they compile against the
+// signatures, which is the claim being reviewed, and the day a body
+// lands the suite says whether the body agrees with what was promised.
+//
+// The boundaries here are the ones a hand-rolled tar writer gets
+// wrong: `blocks_for(0)` is 0 and not 1, `padding_for(0)` is 0 and not
+// 512, and `padding_for(512)` is 0 and not 512 either.
+
+use std.test
+use tar
+
+@test
+fn test_the_block_size_is_512() [io]
+    test.case("the only number in the format")
+    test.assert(tar.block_size() == 512)
+
+@test
+fn test_blocks_for_rounds_up() [io]
+    test.case("a partial block still costs a block")
+    test.assert(tar.blocks_for(1) == 1)
+    test.assert(tar.blocks_for(511) == 1)
+    test.assert(tar.blocks_for(512) == 1)
+    test.assert(tar.blocks_for(513) == 2)
+
+@test
+fn test_an_empty_payload_occupies_no_blocks() [io]
+    test.case("a directory has a header block and no data blocks")
+    test.assert(tar.blocks_for(0) == 0)
+
+@test
+fn test_padding_is_zero_on_a_boundary() [io]
+    test.case("a payload that already ends on a block needs no padding")
+    test.assert(tar.padding_for(512) == 0)
+    test.assert(tar.padding_for(1024) == 0)
+
+@test
+fn test_an_empty_payload_needs_no_padding() [io]
+    test.case("the case a hand-rolled writer pads with a whole block")
+    test.assert(tar.padding_for(0) == 0)
+
+@test
+fn test_padding_completes_the_block() [io]
+    test.case("size plus padding is always a multiple of 512")
+    test.assert(tar.padding_for(1) == 511)
+    test.assert(tar.padding_for(513) == 511)
+    test.assert(tar.padding_for(1000) == 24)
+
+@test
+fn test_the_end_of_archive_is_two_blocks() [io]
+    test.case("POSIX asks for two, and this package writes exactly two")
+    test.assert(bytes.len(tar.end_of_archive()) == 1024)
+
+@test
+fn test_the_end_of_archive_is_zeroes() [io]
+    test.case("and both of them are zero blocks")
+    let e = tar.end_of_archive()
+    test.assert(tar.is_zero_block(bytes.slice(e, 0, 512)))
+    test.assert(tar.is_zero_block(bytes.slice(e, 512, 1024)))
+
+@test
+fn test_a_short_block_is_not_a_zero_block() [io]
+    test.case("a truncated archive must not look like a complete one")
+    test.assert(tar.is_zero_block(bytes.from_str("")) == false)
+
+@test
+fn test_format_names_are_tars_own_spellings() [io]
+    test.case("what `tar --format=` accepts")
+    test.assert(tar.format_name(UstarFormat) == "ustar")
+    test.assert(tar.format_name(PaxFormat) == "pax")
+    test.assert(tar.format_name(V7Format) == "v7")

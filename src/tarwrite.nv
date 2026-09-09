@@ -1,0 +1,260 @@
+// tarwrite.nv — the writer: headers and data in, 512-byte blocks out,
+// nothing performed.
+//
+// THE SHAPE
+//
+// Every call returns bytes the caller writes wherever it likes:
+//
+//     var w = tarwrite.writer(PaxFormat)
+//     let (w2, blocks) = tarwrite.write_header(w, h)!    // one entry's header
+//     let (w3, more)   = tarwrite.write_data(w2, chunk)  // as often as needed
+//     let (w4, pad)    = tarwrite.end_entry(w3)!         // pad to a block
+//     let tail         = tarwrite.finish(w4)!            // two zero blocks
+//
+// The writer is a state machine and not a pure function per entry
+// because tar has exactly one piece of cross-entry state that matters
+// and one within-entry rule that a caller cannot be trusted with:
+//
+//   · the padding.  An entry's data is followed by up to 511 zero
+//     bytes, and the count depends on how much data went in, which the
+//     writer counted and the caller did not.  `end_entry` is where
+//     that lands.
+//   · the size.  A header declares its payload's length BEFORE the
+//     payload; a caller that then writes a different number of bytes
+//     produces an archive whose next header is at the wrong offset and
+//     which every reader mis-parses from there on.  `end_entry`
+//     refuses when the counts disagree, which turns a silently corrupt
+//     archive into an error at the entry that caused it.
+//
+// WHY THE FORMAT IS THE WRITER'S ARGUMENT
+//
+// Because it is a compatibility decision, and only the caller knows
+// who is reading.  `PaxFormat` has no limits and is what every tool
+// since about 2003 reads; `UstarFormat` is what a very old reader
+// wants and refuses a path over 255 bytes or a file over 8 GiB. Under
+// PAX the writer emits the extended-header entry itself when a field
+// needs one — the caller never builds an `x` entry by hand.
+//
+// `V7Format` is refused: it is a layout this package reads and will
+// not produce, because writing one in 2026 has no upside and loses
+// every field it does not have.
+
+use tar
+use tarheader
+
+// A writer between entries.
+//
+// Opaque in practice.  It holds no buffer of the caller's data —
+// `write_data` returns bytes rather than accumulating them — so a
+// writer's cost is a handful of integers however large the archive
+// becomes.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     println("${tarwrite.total_out(tarwrite.writer(PaxFormat))}")     // 0
+// ```
+pub struct TarWriter
+    // The layout this writer emits, unchanged.
+    format: TarFormat
+    // Bytes emitted so far, across every call.
+    produced: Int
+    // How many payload bytes the current entry still owes according
+    // to the header that was written for it.
+    owed: Int
+    // How many payload bytes have actually been written for it.  The
+    // pair with `owed` is what `end_entry` checks.
+    written: Int
+    // How many entries have had a header written.
+    entries: Int
+    // Whether an entry is open — a header has been written and
+    // `end_entry` has not.
+    in_entry: Bool
+    // Whether `finish` has been called.
+    done: Bool
+
+// A writer at the start of an archive.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     println("${tar.format_name(tarwrite.writer_format(tarwrite.writer(PaxFormat)))}")
+// ```
+pub fn writer(fmt: TarFormat) -> TarWriter
+    todo("tar-nv.writer")
+
+// The layout this writer emits.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     println("${tar.format_name(tarwrite.writer_format(tarwrite.writer(UstarFormat)))}")
+// ```
+pub fn writer_format(w: TarWriter) -> TarFormat
+    todo("tar-nv.writer_format")
+
+// Begin an entry: its header block, and under PAX the extended header
+// that precedes it when one is needed.
+//
+// The return is one to three blocks — an `x` entry's header, its
+// records padded to a block, and the entry's own header — and the
+// caller writes them in the order given without needing to know which
+// is which.  That is the point: a caller writing a 300-byte path under
+// PAX calls this once.
+//
+// `PathTooLong` or `FieldTooLarge` under `UstarFormat` when the header
+// does not fit, naming the field; refuses always under `V7Format`;
+// refuses when an entry is already open, which is a caller that forgot
+// `end_entry` and would otherwise produce a corrupt archive.
+//
+// ```novo
+// use tarwrite
+// use tarheader
+// use tar
+//
+// fn main() [io]
+//     let w = tarwrite.writer(PaxFormat)
+//     match tarwrite.write_header(w, tarheader.header("notes.txt", 12))
+//         Ok((_, b)) => println("${bytes.len(b)}")         // 512
+//         Err(_)     => println("does not fit")
+// ```
+pub fn write_header(w: TarWriter, h: TarHeader) -> Result<(TarWriter, Bytes), TarError>
+    todo("tar-nv.write_header")
+
+// The current entry's payload, or some of it.
+//
+// The bytes come straight back — this writer buffers nothing — so a
+// caller streaming a 4 GiB file through it never holds more than its
+// own chunk.  An empty chunk is legal and produces nothing.
+//
+// Anything past the size the header declared is refused rather than
+// truncated: silently dropping it would produce an archive that reads
+// cleanly and is missing data, which is the worst outcome available.
+//
+// ```novo
+// use tarwrite
+// use tarheader
+// use tar
+//
+// fn main() [io]
+//     let w = tarwrite.writer(PaxFormat)
+//     let (w2, _) = tarwrite.write_data(w, bytes.from_str(""))
+//     println("${tarwrite.total_out(w2)}")                 // 0
+// ```
+pub fn write_data(w: TarWriter, chunk: Bytes) -> (TarWriter, Bytes)
+    todo("tar-nv.write_data")
+
+// End the current entry: the padding that takes it to a block
+// boundary.
+//
+// Zero to 511 bytes, and zero exactly when the payload was already a
+// multiple of 512 — including when it was empty, which is the case a
+// hand-rolled writer pads with a spurious whole block.
+//
+// `FieldTooLarge` when fewer bytes were written than the header
+// declared, naming `size` and carrying what was promised. That is the
+// check that turns a caller's off-by-one into an error here rather
+// than into an archive whose every later entry is at the wrong offset.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     match tarwrite.end_entry(tarwrite.writer(PaxFormat))
+//         Ok((_, p)) => println("${bytes.len(p)}")         // 0 — no entry was open
+//         Err(_)     => println("size mismatch")
+// ```
+pub fn end_entry(w: TarWriter) -> Result<(TarWriter, Bytes), TarError>
+    todo("tar-nv.end_entry")
+
+// A whole small entry in one call: header, payload and padding.
+//
+// For the caller whose file is already in memory, which is most
+// callers writing an archive of source or config. `write_header` +
+// `write_data` + `end_entry`, with the size taken from the data rather
+// than from the header — so the one mistake this API can make is not
+// available here.
+//
+// ```novo
+// use tarwrite
+// use tarheader
+// use tar
+//
+// fn main() [io]
+//     let w = tarwrite.writer(PaxFormat)
+//     match tarwrite.write_entry(w, tarheader.header("a.txt", 0), bytes.from_str("hi"))
+//         Ok((_, b)) => println("${bytes.len(b)}")         // 1024
+//         Err(_)     => println("does not fit")
+// ```
+pub fn write_entry(w: TarWriter, h: TarHeader, data: Bytes) -> Result<(TarWriter, Bytes), TarError>
+    todo("tar-nv.write_entry")
+
+// End the archive: the two zero blocks.
+//
+// 1,024 bytes, and the writer is done. `FieldTooLarge` when an entry
+// is still open — an archive whose last entry was never padded is one
+// no reader gets to the end of.
+//
+// GNU tar pads further to a 10,240-byte record; that is a tape
+// convention rather than a requirement, and a caller who wants it
+// appends its own zeroes. This package has no idea what it is being
+// written to and will not guess.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     match tarwrite.finish(tarwrite.writer(PaxFormat))
+//         Ok((_, b)) => println("${bytes.len(b)}")         // 1024
+//         Err(_)     => println("an entry is still open")
+// ```
+pub fn finish(w: TarWriter) -> Result<(TarWriter, Bytes), TarError>
+    todo("tar-nv.finish")
+
+// Bytes emitted so far, across every call.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     println("${tarwrite.total_out(tarwrite.writer(UstarFormat))}")   // 0
+// ```
+pub fn total_out(w: TarWriter) -> Int
+    todo("tar-nv.total_out")
+
+// How many entries have had a header written.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     println("${tarwrite.entries_written(tarwrite.writer(PaxFormat))}")   // 0
+// ```
+pub fn entries_written(w: TarWriter) -> Int
+    todo("tar-nv.entries_written")
+
+// Whether an entry is open — a header written and `end_entry` not yet
+// called.
+//
+// The predicate a caller's loop uses to know whether it owes an
+// `end_entry` before it can start the next entry or finish.
+//
+// ```novo
+// use tarwrite
+// use tar
+//
+// fn main() [io]
+//     println("${tarwrite.in_entry(tarwrite.writer(PaxFormat))}")      // false
+// ```
+pub fn in_entry(w: TarWriter) -> Bool
+    todo("tar-nv.in_entry")

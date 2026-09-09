@@ -1,0 +1,120 @@
+// tarwrite_tests.nv — the API suite for the writer.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See tar_tests.nv for why
+// an interface package ships a failing suite.
+//
+// The assertions here are about the two rules the writer keeps for the
+// caller: that padding follows the size that was actually written, and
+// that a payload which disagrees with its header's declared size is
+// refused rather than silently written.  The second one is the whole
+// reason the writer is a state machine — a caller's off-by-one becomes
+// an error at the entry that caused it instead of an archive whose
+// every later entry is at the wrong offset.
+
+use std.test
+use tar
+use tarheader
+use tarwrite
+
+@test
+fn test_a_fresh_writer_has_emitted_nothing() [io]
+    test.case("no header goes out until one is asked for")
+    let w = tarwrite.writer(PaxFormat)
+    test.assert(tarwrite.total_out(w) == 0)
+    test.assert(tarwrite.entries_written(w) == 0)
+    test.assert(tarwrite.in_entry(w) == false)
+
+@test
+fn test_the_writer_remembers_its_format() [io]
+    test.case("the compatibility decision is the caller's, once")
+    test.assert(tar.format_name(tarwrite.writer_format(tarwrite.writer(UstarFormat))) == "ustar")
+    test.assert(tar.format_name(tarwrite.writer_format(tarwrite.writer(PaxFormat))) == "pax")
+
+@test
+fn test_a_header_is_one_block_when_it_fits() [io]
+    test.case("a short path under USTAR needs no extended header")
+    let w = tarwrite.writer(UstarFormat)
+    match tarwrite.write_header(w, tarheader.header("notes.txt", 12))
+        Ok((w2, b)) =>
+            test.assert(bytes.len(b) == 512)
+            test.assert(tarwrite.in_entry(w2))
+            test.assert(tarwrite.entries_written(w2) == 1)
+        Err(_)      => test.fail("a short path would not fit USTAR")
+
+@test
+fn test_v7_is_refused_by_the_writer_too() [io]
+    test.case("this package reads the layout and will not produce it")
+    match tarwrite.write_header(tarwrite.writer(V7Format), tarheader.header("a", 1))
+        Ok(_)  => test.fail("a V7 header was written")
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_empty_write_produces_nothing() [io]
+    test.case("zero bytes in, zero bytes out")
+    let (w2, out) = tarwrite.write_data(tarwrite.writer(PaxFormat), bytes.from_str(""))
+    test.assert(bytes.len(out) == 0)
+    test.assert(tarwrite.total_out(w2) == 0)
+
+@test
+fn test_the_end_of_an_archive_is_two_blocks() [io]
+    test.case("finish emits exactly the end-of-archive marker")
+    match tarwrite.finish(tarwrite.writer(PaxFormat))
+        Ok((w2, b)) =>
+            test.assert(bytes.len(b) == 1024)
+            test.assert(tarwrite.total_out(w2) == 1024)
+        Err(_)      => test.fail("an archive with no entries would not finish")
+
+@test
+fn test_finishing_with_an_entry_open_is_refused() [io]
+    test.case("an unpadded last entry is an archive no reader finishes")
+    let w = tarwrite.writer(PaxFormat)
+    match tarwrite.write_header(w, tarheader.header("a.txt", 10))
+        Ok((w2, _)) => match tarwrite.finish(w2)
+            Ok(_)  => test.fail("an archive finished with an entry still open")
+            Err(_) => test.assert(true)
+        Err(_)      => test.fail("a short path would not fit PAX")
+
+@test
+fn test_a_payload_shorter_than_its_header_is_refused() [io]
+    test.case("the off-by-one that would move every later entry")
+    let w = tarwrite.writer(PaxFormat)
+    match tarwrite.write_header(w, tarheader.header("a.txt", 10))
+        Ok((w2, _)) =>
+            let (w3, _) = tarwrite.write_data(w2, bytes.from_str("short"))
+            match tarwrite.end_entry(w3)
+                Ok(_)  => test.fail("five bytes closed an entry that declared ten")
+                Err(_) => test.assert(true)
+        Err(_)      => test.fail("a short path would not fit PAX")
+
+@test
+fn test_ending_with_no_entry_open_pads_nothing() [io]
+    test.case("and does not fail")
+    match tarwrite.end_entry(tarwrite.writer(PaxFormat))
+        Ok((_, p)) => test.assert(bytes.len(p) == 0)
+        Err(_)     => test.fail("ending nothing was refused")
+
+@test
+fn test_a_whole_small_entry_is_a_header_and_a_padded_block() [io]
+    test.case("two bytes of payload still occupy one whole data block")
+    let w = tarwrite.writer(PaxFormat)
+    match tarwrite.write_entry(w, tarheader.header("a.txt", 0), bytes.from_str("hi"))
+        Ok((w2, b)) =>
+            test.assert(bytes.len(b) == 1024)
+            test.assert(tarwrite.in_entry(w2) == false)
+        Err(_)      => test.fail("a two-byte file would not write")
+
+@test
+fn test_an_empty_entry_is_a_header_and_nothing_else() [io]
+    test.case("a directory has no data blocks and no padding")
+    let w = tarwrite.writer(PaxFormat)
+    match tarwrite.write_entry(w, tarheader.directory("src"), bytes.from_str(""))
+        Ok((_, b)) => test.assert(bytes.len(b) == 512)
+        Err(_)     => test.fail("a directory entry would not write")
+
+@test
+fn test_write_entry_takes_the_size_from_the_data() [io]
+    test.case("the header's declared size cannot disagree in this form")
+    let w = tarwrite.writer(PaxFormat)
+    match tarwrite.write_entry(w, tarheader.header("a.txt", 9999), bytes.from_str("hi"))
+        Ok((_, b)) => test.assert(bytes.len(b) == 1024)
+        Err(_)     => test.fail("a wrong declared size was not corrected from the data")

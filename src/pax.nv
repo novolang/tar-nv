@@ -1,0 +1,184 @@
+// pax.nv — POSIX.1-2001's extended header records, which are how tar
+// stopped having limits.
+//
+// WHAT A PAX RECORD IS
+//
+// A length-prefixed `key=value` line:
+//
+//     "%d %s=%s\n" % (total_length, key, value)
+//
+// where `total_length` counts ITSELF.  That self-reference is the
+// whole trick and the whole trap: `30 mtime=1757376000.5\n` is
+// thirty bytes including the two digits of "30", so a writer that
+// computes the length without them produces a record every reader
+// rejects, and one that gets it wrong by a digit at the 9-to-10
+// boundary produces a record that works for short values and fails
+// for long ones.  `emit_records` computes it correctly, once, and
+// that is the main reason this module exists rather than being three
+// lines at a call site.
+//
+// The records live in the data blocks of a `TarPaxHeader` (`x`) entry
+// and apply to the entry AFTER it, or of a `TarGlobalPaxHeader` (`g`)
+// entry and apply to every entry after that until replaced.  Both are
+// consumed by `tarread` and never handed to a caller as entries.
+//
+// WHY THE VALUE IS A `Str` AND NOT A TYPE PER KEY
+//
+// Because the key space is open.  POSIX defines eleven keys, GNU adds
+// its own, Schily's tar adds more, and a vendor may add
+// `VENDOR.keyword` freely — so a parser that typed each key would
+// refuse the archives it most needed to read.  Every value is text;
+// `pax` hands it back as text; the typed reads a caller actually
+// wants — `path`, `size`, `mtime` — are the named accessors below,
+// which know their own key's encoding.
+//
+// THE ENCODING IS UTF-8, AND IT IS NOT VALIDATED
+//
+// POSIX says a PAX value is UTF-8.  This package does not check, for
+// the same reason csv-nv does not check a field: an archive with a
+// Latin-1 file name in it is an archive that exists and that somebody
+// has to extract.  A caller that needs the guarantee validates what it
+// got.
+
+use tarheader
+
+// One `key=value` record from an extended header.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     println("${pax.record("path", "a/very/long/name").key}")     // path
+// ```
+pub struct PaxRecord
+    // The key, as it appeared: `path`, `linkpath`, `size`, `mtime`,
+    // `uid`, `gid`, `uname`, `gname`, `atime`, `ctime`, `comment`, or
+    // any vendor key at all.
+    key: Str
+    // The value, as bytes-that-are-probably-UTF-8, unvalidated.
+    value: Str
+
+// A record from a key and a value.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     println("${pax.record("size", "8589934592").value}")
+// ```
+pub fn record(key: Str, value: Str) -> PaxRecord
+    todo("tar-nv.pax.record")
+
+// Parse the data blocks of an extended header into records.
+//
+// `BadPaxRecord` when a length is not a number, when a length does not
+// match the record it prefixes, or when a record has no `=`. The
+// `block` argument is the archive block the extended header started
+// at, and is used only to place those errors.
+//
+// Records are returned in the order they appeared, INCLUDING repeats:
+// POSIX says a later record for a key replaces an earlier one, so the
+// order is meaningful and de-duplicating here would throw away the
+// rule. `lookup` applies it.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     match pax.parse_records(bytes.from_str(""), 0)
+//         Ok(rs) => println("${list.len(rs)}")             // 0
+//         Err(_) => println("malformed")
+// ```
+pub fn parse_records(data: Bytes, block: Int) -> Result<[PaxRecord], TarError>
+    todo("tar-nv.pax.parse_records")
+
+// Records as the bytes of an extended header's payload.
+//
+// Each record is `"%d %s=%s\n"` with the length counting itself, which
+// is the arithmetic this module exists to get right.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     let b = pax.emit_records([pax.record("path", "x")])
+//     println("${bytes.len(b)}")                           // 13
+// ```
+pub fn emit_records(rs: [PaxRecord]) -> Bytes
+    todo("tar-nv.pax.emit_records")
+
+// The value for a key, with POSIX's last-one-wins rule applied.
+//
+// `None` when no record has the key.  A record with an EMPTY value is
+// not the same as a missing one: POSIX gives it the meaning "delete
+// the value a global header set", so this returns `Some("")` for it
+// and a caller matching on `None` will not confuse the two.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     match pax.lookup([pax.record("path", "x")], "path")
+//         Some(v) => println(v)                            // x
+//         None    => println("absent")
+// ```
+pub fn lookup(rs: [PaxRecord], key: Str) -> ?Str
+    todo("tar-nv.pax.lookup")
+
+// The records a header needs in order to be written without loss.
+//
+// The bridge between `tarheader` and this module, and the reason a
+// caller writing PAX does not have to know which fields overflow: give
+// it a header and the format's limits, get back the records — a
+// `path` record for a path USTAR cannot hold, a `linkpath` for a link
+// target, a `size` for a payload over 8 GiB, `uid`/`gid` for ids over
+// 2,097,151, `uname`/`gname` for names over 32 bytes.  An empty list
+// when the header fits USTAR entirely, which is the common case and
+// costs nothing.
+//
+// ```novo
+// use pax
+// use tarheader
+//
+// fn main() [io]
+//     println("${list.len(pax.records_for(tarheader.header("a.txt", 10)))}")  // 0
+// ```
+pub fn records_for(h: TarHeader) -> [PaxRecord]
+    todo("tar-nv.pax.records_for")
+
+// A header with a set of records applied over it.
+//
+// The other half of the bridge, and what the reader does when it meets
+// an `x` entry: the extended header's `path` replaces the block's
+// path, its `size` replaces the block's size, and so on for every key
+// this package understands. Keys it does not understand are left in
+// the entry's record list for a caller to read, never dropped —
+// a vendor key is the caller's business and losing it would be this
+// package deciding what matters.
+//
+// ```novo
+// use pax
+// use tarheader
+//
+// fn main() [io]
+//     let h = pax.apply(tarheader.header("short", 1), [pax.record("path", "much/longer")])
+//     println(h.path)                                      // much/longer
+// ```
+pub fn apply(h: TarHeader, rs: [PaxRecord]) -> TarHeader
+    todo("tar-nv.pax.apply")
+
+// The size in bytes an extended header's payload will occupy.
+//
+// `bytes.len(emit_records(rs))` without building the bytes, for the
+// writer computing a header block before it has the payload.  It is
+// exposed because the self-counting length makes this genuinely hard
+// to predict and a caller building an index needs the number.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     println("${pax.records_size([pax.record("path", "x")])}")   // 13
+// ```
+pub fn records_size(rs: [PaxRecord]) -> Int
+    todo("tar-nv.pax.records_size")

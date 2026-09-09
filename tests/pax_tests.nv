@@ -1,0 +1,127 @@
+// pax_tests.nv — the API suite for the extended-header records.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See tar_tests.nv for why
+// an interface package ships a failing suite.
+//
+// The assertions worth writing here are all about the self-counting
+// length.  `"path=x"` is six bytes, plus a newline is seven, plus a
+// space is eight, plus the digits of the total — and the total is 10,
+// which is two digits, so the record is ten bytes and the naive
+// answer of nine is wrong.  A writer that computes the length without
+// counting its own digits works for short values and fails at the
+// 9-to-10 boundary, which is exactly the bug this suite is here to
+// catch the day a body lands.
+
+use std.test
+use pax
+use tarheader
+
+@test
+fn test_a_record_keeps_its_key_and_value() [io]
+    test.case("no parsing, no typing — a record is two strings")
+    let r = pax.record("path", "a/very/long/name")
+    test.assert(r.key == "path")
+    test.assert(r.value == "a/very/long/name")
+
+@test
+fn test_the_length_prefix_counts_itself() [io]
+    test.case("`10 path=x\\n` is ten bytes including the two digits of 10")
+    test.assert(pax.records_size([pax.record("path", "x")]) == 10)
+
+@test
+fn test_the_length_survives_the_nine_to_ten_boundary() [io]
+    test.case("the case a naive writer gets wrong")
+    // "N size=1\n" is 9 bytes when the prefix is one digit, which
+    // makes the prefix "9" and the record nine bytes.
+    test.assert(pax.records_size([pax.record("size", "1")]) == 9)
+    // One more byte of value tips the total to ten, which needs two
+    // digits, which tips it to eleven.
+    test.assert(pax.records_size([pax.record("size", "12")]) == 11)
+
+@test
+fn test_records_size_agrees_with_emit_records() [io]
+    test.case("the predicted length is the emitted length")
+    let rs = [pax.record("path", "a/b/c"), pax.record("mtime", "1757376000")]
+    test.assert(pax.records_size(rs) == bytes.len(pax.emit_records(rs)))
+
+@test
+fn test_an_empty_record_set_emits_nothing() [io]
+    test.case("a header that fits USTAR needs no extended header at all")
+    test.assert(bytes.len(pax.emit_records([])) == 0)
+    test.assert(pax.records_size([]) == 0)
+
+@test
+fn test_parsing_nothing_gives_no_records() [io]
+    test.case("an empty payload is not a malformed one")
+    match pax.parse_records(bytes.from_str(""), 0)
+        Ok(rs) => test.assert(list.len(rs) == 0)
+        Err(_) => test.fail("an empty extended header was refused")
+
+@test
+fn test_a_record_round_trips() [io]
+    test.case("what emit_records wrote, parse_records reads")
+    let rs = [pax.record("path", "a/very/long/name"), pax.record("size", "8589934592")]
+    match pax.parse_records(pax.emit_records(rs), 0)
+        Ok(back) =>
+            test.assert(list.len(back) == 2)
+            match list.first(back)
+                Some(r) => test.assert(r.key == "path")
+                None    => test.fail("two records parsed back as none")
+        Err(_)   => test.fail("records this package wrote would not parse")
+
+@test
+fn test_a_bad_length_is_refused_with_a_reason() [io]
+    test.case("a prefix that is not a number")
+    match pax.parse_records(bytes.from_str("xx path=a\n"), 3)
+        Ok(_)                   => test.fail("a non-numeric length was accepted")
+        Err(BadPaxRecord(b, _)) => test.assert(b == 3)
+        Err(_)                  => test.fail("refused for the wrong reason")
+
+@test
+fn test_a_record_with_no_equals_is_refused() [io]
+    test.case("`9 pathxxx\\n` has a key and no value")
+    match pax.parse_records(bytes.from_str("9 pathxx\n"), 0)
+        Ok(_)                   => test.fail("a record with no '=' was accepted")
+        Err(BadPaxRecord(_, _)) => test.assert(true)
+        Err(_)                  => test.fail("refused for the wrong reason")
+
+@test
+fn test_lookup_applies_last_one_wins() [io]
+    test.case("POSIX says a later record replaces an earlier one")
+    let rs = [pax.record("path", "first"), pax.record("path", "second")]
+    match pax.lookup(rs, "path")
+        Some(v) => test.assert(v == "second")
+        None    => test.fail("a present key looked up as absent")
+
+@test
+fn test_an_empty_value_is_not_a_missing_key() [io]
+    test.case("POSIX gives an empty value the meaning `delete the global`")
+    match pax.lookup([pax.record("mtime", "")], "mtime")
+        Some(v) => test.assert(v == "")
+        None    => test.fail("an empty value read as an absent key")
+
+@test
+fn test_a_missing_key_is_none() [io]
+    test.case("and an absent key really is absent")
+    match pax.lookup([pax.record("path", "x")], "size")
+        Some(_) => test.fail("a key that is not there was found")
+        None    => test.assert(true)
+
+@test
+fn test_a_short_header_needs_no_records() [io]
+    test.case("the common case costs nothing")
+    test.assert(list.len(pax.records_for(tarheader.header("a.txt", 10))) == 0)
+
+@test
+fn test_apply_overrides_the_block() [io]
+    test.case("a path record replaces what the 512 bytes said")
+    let h = pax.apply(tarheader.header("short", 1), [pax.record("path", "much/longer")])
+    test.assert(h.path == "much/longer")
+
+@test
+fn test_apply_leaves_untouched_fields_alone() [io]
+    test.case("a record set that says nothing about size does not move it")
+    let base = tarheader.header("short", 40)
+    let h = pax.apply(base, [pax.record("path", "much/longer")])
+    test.assert(h.size == 40)
+    test.assert(h.mode == base.mode)

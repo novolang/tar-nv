@@ -1,0 +1,157 @@
+// tar.nv — the block arithmetic and the format choice, which are the
+// two things every other module here takes.
+//
+// A TAR ARCHIVE IS ARITHMETIC
+//
+// There is no compression in tar, no index, no checksum over the
+// archive, and no framing beyond one number: 512.  An archive is a
+// sequence of 512-byte blocks; an entry is one header block followed
+// by `ceil(size / 512)` data blocks; the archive ends with two blocks
+// of zeroes.  That is the entire format, and it is why this package is
+// `core` without a single concession: everything it does is integer
+// arithmetic over bytes the caller already holds.
+//
+// The functions here are the arithmetic itself, exposed rather than
+// hidden, because a caller doing random access into an archive — a
+// seekable reader, an index builder, `archive-nv` extracting one
+// entry — has to do the same sums and should not have to rediscover
+// that `padding_for(0)` is 0 and not 512.
+//
+// THE THREE FORMATS, AND WHY THE CHOICE IS THE WRITER'S
+//
+// USTAR (POSIX.1-1988) fixes every field at a fixed width: 100 bytes
+// of name, 155 of prefix, 12 octal digits of size.  PAX
+// (POSIX.1-2001) keeps those blocks and adds an extended header
+// carrying `key=value` records with no limits at all, which is how a
+// path of any length, a size over 8 GiB, or a sub-second mtime gets
+// written.  V7 is the pre-USTAR layout with no magic and no prefix,
+// which readers still meet and no writer should produce.
+//
+// The reader accepts all three and does not need telling.  The WRITER
+// has to be told, because the choice is a compatibility decision the
+// caller owns: PAX is what every modern tool reads and what a long
+// path requires, USTAR is what a 1990s reader will accept, and
+// `PathTooLong` and `FieldTooLarge` are the two errors that say the
+// caller chose USTAR and then handed it something that does not fit.
+
+// Which layout a writer emits, and which one a reader found.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${tar.format_name(PaxFormat)}")         // pax
+// ```
+pub enum TarFormat
+    // POSIX.1-1988: `ustar\0` + version `00`, the 155-byte prefix, and
+    // every field at its fixed width.  What to choose when the reader
+    // on the other end is old and the paths are short.
+    UstarFormat
+    // POSIX.1-2001: USTAR's blocks plus extended-header records for
+    // anything that does not fit them.  The default for a writer,
+    // because it is the only one of the three with no limits.
+    PaxFormat
+    // The pre-USTAR layout: no magic, no prefix, no `typeflag` beyond
+    // regular and link.  Readable, and this package will not write it.
+    V7Format
+
+// The name of a format, for a message.
+//
+// `ustar`, `pax`, `v7` — the spellings `tar --format=` uses, so a
+// caller can print this into a command line or an error and be
+// understood.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${tar.format_name(UstarFormat)}")       // ustar
+// ```
+pub fn format_name(f: TarFormat) -> Str
+    todo("tar-nv.format_name")
+
+// 512 — the block size, and the only number in the format.
+//
+// A function rather than a literal at each call site so that the fact
+// has one home and a reader who wonders where 512 came from finds it
+// documented once.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${tar.block_size()}")                   // 512
+// ```
+pub fn block_size() -> Int
+    todo("tar-nv.block_size")
+
+// How many 512-byte blocks a payload of `size` bytes occupies.
+//
+// `ceil(size / 512)`, and 0 for a size of 0 — a directory or an empty
+// file has a header block and no data blocks at all, which is the
+// case an implementation that wrote `size / 512 + 1` gets wrong.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${tar.blocks_for(513)}")                // 2
+//     println("${tar.blocks_for(0)}")                  // 0
+// ```
+pub fn blocks_for(size: Int) -> Int
+    todo("tar-nv.blocks_for")
+
+// How many padding bytes follow a payload of `size` bytes.
+//
+// `0` when the size is already a multiple of 512, INCLUDING zero —
+// the other case an implementation gets wrong, by padding an empty
+// file with a whole block of nothing.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${tar.padding_for(513)}")               // 511
+//     println("${tar.padding_for(512)}")               // 0
+//     println("${tar.padding_for(0)}")                 // 0
+// ```
+pub fn padding_for(size: Int) -> Int
+    todo("tar-nv.padding_for")
+
+// Whether a 512-byte block is all zeroes.
+//
+// The end-of-archive rule is two of these in a row (POSIX.1-2017), and
+// this is the predicate it is built from.  Exposed because a caller
+// scanning an archive by hand needs exactly this test and because it
+// is the one place a reader can legitimately stop early.
+//
+// A block shorter than 512 bytes is not a zero block — it is a
+// `ShortBlock`, and answering true here would let a truncated archive
+// look like a complete one.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${tar.is_zero_block(bytes.from_str(""))}")   // false — too short
+// ```
+pub fn is_zero_block(block: Bytes) -> Bool
+    todo("tar-nv.is_zero_block")
+
+// The two zero blocks that end an archive: 1,024 bytes.
+//
+// POSIX requires two and every reader accepts them; GNU tar pads
+// further to a 10,240-byte record boundary by default, which is a
+// convention for tape drives and not a requirement. This package
+// writes the two and lets a caller who wants tape padding append its
+// own zeroes — because a `core` package has no idea what it is being
+// written to.
+//
+// ```novo
+// use tar
+//
+// fn main() [io]
+//     println("${bytes.len(tar.end_of_archive())}")    // 1024
+// ```
+pub fn end_of_archive() -> Bytes
+    todo("tar-nv.end_of_archive")

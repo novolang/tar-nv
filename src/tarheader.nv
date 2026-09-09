@@ -1,0 +1,379 @@
+// tarheader.nv — the 512-byte header block as a value with every
+// field typed.
+//
+// WHY THIS IS NOT A 512-BYTE BLOB WITH ACCESSORS
+//
+// Because every field in a tar header is text pretending to be a
+// number, and the pretence is where every tar bug lives.  The size is
+// eleven octal digits and a NUL, unless it is over 8 GiB, in which
+// case it is base-256 with the high bit of the first byte set.  The
+// mode is octal.  The mtime is octal seconds since 1970, unless a PAX
+// record overrode it with a decimal fraction.  The checksum is octal,
+// computed over a header in which the checksum field itself is read as
+// eight spaces.  A caller handed a blob and told to read field 6 will
+// get one of these wrong, and the failure will be a file with the
+// wrong size that nothing notices until it is restored.
+//
+// So the parse happens once, here, and a `TarHeader` is integers and
+// strings.  `emit` writes the encodings back, choosing octal or
+// base-256 by what fits.  The 512 bytes exist only at the two edges.
+//
+// THE PREFIX SPLIT IS NOT THE CALLER'S PROBLEM
+//
+// USTAR stores a path in two fields — 155 bytes of `prefix` and 100 of
+// `name`, joined with a `/` — and the split point is wherever a `/`
+// happens to be at the right distance.  Neither field is meaningful on
+// its own.  So `TarHeader` carries ONE `path`, `emit` finds a split if
+// there is one, and `PathTooLong` is what it returns when there is
+// not.  A caller never sees `prefix`.
+//
+// WHAT IS NOT HERE
+//
+// No filesystem.  `path` is a string the caller supplied or the reader
+// found; `mode`, `uid`, `gid` and `mtime` are integers with no
+// relationship to any machine.  Nothing in this module knows whether
+// the file exists, and the README says what that means for a caller
+// extracting to disk — the sanitising is theirs, and it has to happen.
+
+// What an entry is.
+//
+// The `typeflag` byte as a value.  The prefixed names are for the
+// registry-wide constructor namespace (see the README), and the
+// spelling is POSIX's own vocabulary otherwise.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.kind_byte(TarDirectory)}")      // 53 — '5'
+// ```
+pub enum TarEntryKind
+    // `0` or NUL: an ordinary file.  NUL is the pre-POSIX spelling and
+    // is still written by some tools; both parse to this.
+    TarFile
+    // `5`: a directory.  Its size field is 0 and any data blocks it
+    // claims are a malformed archive.
+    TarDirectory
+    // `2`: a symbolic link.  The target is in `link`, not in the data
+    // blocks — a symlink entry has no data.
+    TarSymlink
+    // `1`: a hard link to an earlier entry in the same archive.  The
+    // target is in `link` and there is no data.
+    TarHardLink
+    // `3`: a character device.  `devmajor` and `devminor` carry the
+    // numbers and there is no data.
+    TarCharDevice
+    // `4`: a block device.
+    TarBlockDevice
+    // `6`: a FIFO.  No data.
+    TarFifo
+    // `L`: GNU's long-name entry, whose data blocks are the path of
+    // the entry that follows.  The reader consumes it and never hands
+    // it to a caller; it is in the enum because a caller reading raw
+    // headers will meet it.
+    TarLongName
+    // `K`: GNU's long-link entry, the same trick for a link target.
+    TarLongLink
+    // `x`: a PAX extended header whose data blocks are `key=value`
+    // records that apply to the NEXT entry.  Consumed by the reader.
+    TarPaxHeader
+    // `g`: a PAX global header, whose records apply to every entry
+    // after it until another one replaces them.
+    TarGlobalPaxHeader
+    // Anything else, carrying the byte.  GNU sparse entries (`S`),
+    // volume headers (`V`) and multi-volume continuations (`M`) land
+    // here, and the reader reports `UnsupportedEntryKind` rather than
+    // guessing what their data blocks mean.
+    TarUnknown(byte: Int)
+
+// The `typeflag` byte a kind is written as.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.kind_byte(TarFile)}")           // 48 — '0'
+// ```
+pub fn kind_byte(k: TarEntryKind) -> Int
+    todo("tar-nv.kind_byte")
+
+// The kind a `typeflag` byte means.
+//
+// NUL and `0` both give `TarFile`; anything unrecognised gives
+// `TarUnknown` carrying the byte, so this never fails and a caller
+// reading a strange archive still gets a header it can look at.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.kind_byte(tarheader.kind_of(53))}")    // 53
+// ```
+pub fn kind_of(b: Int) -> TarEntryKind
+    todo("tar-nv.kind_of")
+
+// Whether an entry of this kind is followed by data blocks.
+//
+// True only for `TarFile`, `TarLongName`, `TarLongLink`,
+// `TarPaxHeader` and `TarGlobalPaxHeader`. Everything else — a
+// directory, a link, a device, a FIFO — has a size field that must be
+// zero, and a reader that skipped `size` blocks after one of those
+// would desynchronise on the first archive that wrote a non-zero size
+// by mistake. Which they do.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.has_data(TarSymlink)}")         // false
+// ```
+pub fn has_data(k: TarEntryKind) -> Bool
+    todo("tar-nv.has_data")
+
+// One entry's header, with every field typed.
+//
+// No `prefix` field: USTAR's two-field path split is `emit`'s
+// business, not a caller's, and `path` is the whole path.  No
+// `checksum` field either — a stored checksum that disagreed with the
+// block would be a lie a caller could propagate, so it is computed on
+// `emit` and verified on `parse` and never carried.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.header("notes.txt", 12).size}")     // 12
+// ```
+pub struct TarHeader
+    // The entry's whole path, `prefix` and `name` already joined.  A
+    // relative path with `/` separators — that is what the format
+    // stores and this package does not translate it.
+    path: Str
+    // Permission bits, as a number: 420 is `rw-r--r--` and 493 is
+    // `rwxr-xr-x`, which is what almost every entry carries.  The
+    // high bits (setuid, setgid, sticky) are preserved and this
+    // package attaches no meaning to them.
+    mode: Int
+    // The owning user's numeric id.
+    uid: Int
+    // The owning group's numeric id.
+    gid: Int
+    // The payload's length in bytes.  Zero for everything that is not
+    // a file or an extended header; `tar.blocks_for` turns it into a
+    // block count.
+    size: Int
+    // Modification time, in whole seconds since 1970.  PAX can carry
+    // a fraction; this field cannot, and `pax` is where the fraction
+    // is if a caller needs it.
+    mtime: Int
+    // What the entry is.
+    kind: TarEntryKind
+    // A link's target, for `TarSymlink` and `TarHardLink`; empty
+    // otherwise.
+    link: Str
+    // The owning user's name, which takes precedence over `uid` when
+    // both are present — that is POSIX's rule, and it is what makes an
+    // archive portable between machines with different id maps.
+    uname: Str
+    // The owning group's name, with the same precedence over `gid`.
+    gname: Str
+    // A character or block device's major number; 0 otherwise.
+    devmajor: Int
+    // A character or block device's minor number; 0 otherwise.
+    devminor: Int
+
+// A header for a regular file: a path, a size, and defaults for
+// everything else.
+//
+// Mode 420 (`rw-r--r--`), uid and gid 0, mtime 0, no owner names.  The
+// mtime default is 0 rather than "now" because a `core` package has no
+// clock: reading one is `[time]`, which this layer does not have. A
+// caller who wants the real time passes it to `with_mtime`, and that
+// is the sharpest place the sans-IO rule shows through this
+// interface.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.header("notes.txt", 12).mode}")    // 420
+// ```
+pub fn header(path: Str, size: Int) -> TarHeader
+    todo("tar-nv.header")
+
+// A header for a directory.
+//
+// Mode 493 (`rwxr-xr-x`), size 0, kind `TarDirectory`.  The path is
+// stored with a trailing `/` as every tar writer does — it is not
+// required by the format, and it is what makes `tar t` output readable
+// and what some readers use to decide an entry is a directory when the
+// typeflag is the pre-POSIX NUL.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.directory("src").size}")        // 0
+// ```
+pub fn directory(path: Str) -> TarHeader
+    todo("tar-nv.directory")
+
+// A header for a symbolic link.
+//
+// Size 0 and the target in `link`: a symlink entry has no data blocks,
+// and a writer that put the target in the payload would produce an
+// archive whose links all restore as empty files.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.symlink("latest", "v2.tar").link}")   // v2.tar
+// ```
+pub fn symlink(path: Str, target: Str) -> TarHeader
+    todo("tar-nv.symlink")
+
+// The header with its mode replaced.
+//
+// The mode is a NUMBER, not an octal string: 493 is `rwxr-xr-x` and
+// 420 is `rw-r--r--`.  The format stores it as octal text and this
+// package converts, so a caller never writes the digits itself — which
+// is one fewer place for the field to be mis-encoded.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     let h = tarheader.with_mode(tarheader.header("run.sh", 40), 493)
+//     println("${h.mode}")                                 // 493 — rwxr-xr-x
+// ```
+pub fn with_mode(h: TarHeader, mode: Int) -> TarHeader
+    todo("tar-nv.with_mode")
+
+// The header with its modification time replaced.
+//
+// Whole seconds since 1970, supplied by the caller because this
+// package has no clock.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.with_mtime(tarheader.header("a", 1), 1757376000).mtime}")
+// ```
+pub fn with_mtime(h: TarHeader, mtime: Int) -> TarHeader
+    todo("tar-nv.with_mtime")
+
+// The header with its numeric owner replaced.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.with_owner(tarheader.header("a", 1), 1000, 1000).uid}")
+// ```
+pub fn with_owner(h: TarHeader, uid: Int, gid: Int) -> TarHeader
+    todo("tar-nv.with_owner")
+
+// The header with its owner NAMES replaced.
+//
+// These take precedence over the numeric ids when an archive is
+// restored, which is what makes one portable between machines whose id
+// maps differ — so a writer that has the names should set them.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.with_owner_names(tarheader.header("a", 1), "klaus", "staff").uname}")
+// ```
+pub fn with_owner_names(h: TarHeader, uname: Str, gname: Str) -> TarHeader
+    todo("tar-nv.with_owner_names")
+
+// Parse a 512-byte header block.
+//
+// `BadUstarMagic` when the block is not a header, `BadHeaderChecksum`
+// when it is one whose checksum disagrees, `BadNumericField` when a
+// field is neither octal nor base-256, `ShortBlock` when the buffer is
+// not 512 bytes.  The format it found comes back with it, because a
+// caller re-emitting an entry wants to write what it read.
+//
+// `block` is the block's index in the archive and is used only to
+// place the errors — this function does no seeking of any kind.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     match tarheader.parse(bytes.from_str(""), 0)
+//         Ok(_)  => println("parsed")
+//         Err(_) => println("not 512 bytes")               // this one
+// ```
+pub fn parse(block: Bytes, index: Int) -> Result<(TarHeader, TarFormat), TarError>
+    todo("tar-nv.parse")
+
+// The header as its 512-byte block, in the format asked for.
+//
+// The checksum is computed here, over a block in which the checksum
+// field reads as eight spaces — POSIX's rule, and the one detail that
+// makes a hand-written tar header fail everywhere.  The USTAR
+// prefix/name split is found here too.
+//
+// `PathTooLong` or `FieldTooLarge` when the format cannot carry what
+// the header says: a path over 255 bytes or with no split point under
+// `UstarFormat`, a size over 8 GiB, a uid over 2,097,151. Under
+// `PaxFormat` none of those can happen in this block — they move to
+// the extended header, and `tarwrite.write_entry` is what puts them
+// there. Under `V7Format` this always refuses: the layout is
+// readable and this package will not write it.
+//
+// ```novo
+// use tarheader
+// use tar
+//
+// fn main() [io]
+//     match tarheader.emit(tarheader.header("notes.txt", 12), UstarFormat)
+//         Ok(b)  => println("${bytes.len(b)}")             // 512
+//         Err(_) => println("does not fit")
+// ```
+pub fn emit(h: TarHeader, fmt: TarFormat) -> Result<Bytes, TarError>
+    todo("tar-nv.emit")
+
+// The checksum of a 512-byte block, computed POSIX's way.
+//
+// The unsigned sum of all 512 bytes with the eight checksum bytes
+// counted as spaces (0x20).  Exposed because a caller verifying an
+// archive by hand needs exactly this and because getting it wrong is
+// the single most common defect in a hand-rolled tar writer — the
+// "count the checksum field as spaces" rule is easy to read past.
+//
+// Historical readers also accept a SIGNED sum, which some 1980s
+// writers produced from a compiler with signed `char`. `parse`
+// accepts either; this function computes the unsigned one, which is
+// what to write.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.checksum(bytes.from_str(""))}")     // 0
+// ```
+pub fn checksum(block: Bytes) -> Int
+    todo("tar-nv.checksum")
+
+// Whether a path fits USTAR's two fields, and therefore whether
+// writing it needs PAX.
+//
+// The question a writer asks before it chooses a format, and a caller
+// can ask it too — a build tool that wants USTAR output for
+// compatibility needs to know which of its paths would force PAX
+// before it starts writing.
+//
+// ```novo
+// use tarheader
+//
+// fn main() [io]
+//     println("${tarheader.fits_ustar("src/main.nv")}")     // true
+// ```
+pub fn fits_ustar(path: Str) -> Bool
+    todo("tar-nv.fits_ustar")

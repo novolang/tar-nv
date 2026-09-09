@@ -1,0 +1,167 @@
+// tarerror.nv — every way a tar archive can refuse to be read, and
+// which 512-byte block it happened in.
+//
+// WHY THE POSITION IS A BLOCK NUMBER AND NOT A BYTE OFFSET
+//
+// A tar archive is a sequence of 512-byte blocks and nothing else
+// (POSIX.1-2017 § "pax Interchange Format", and USTAR before it).
+// Every structure in it starts on a block boundary, so "block 1,204"
+// locates a header exactly and a byte offset is the same fact
+// multiplied by 512.  `block_of` answers the block, `byte_of`
+// multiplies for the caller who is about to `dd skip=`, and the two
+// cannot disagree because only one of them is stored.
+//
+// The exception is `ShortBlock`, which is about a block that is not
+// 512 bytes — the end of a truncated file — so it carries a byte
+// offset AND the count it actually got.  That is the one place the
+// block abstraction does not hold, and pretending otherwise would lose
+// the number a person needs.
+//
+// WHY A BAD CHECKSUM IS NOT THE SAME AS A BAD MAGIC
+//
+// Because they mean opposite things about what to do next.  A header
+// with a wrong checksum is a header: the fields are there and a
+// recovery tool can read them anyway, which `tar` itself does under
+// `--ignore-failed-read`.  A block with the wrong magic is not a
+// header at all — it is data the reader has mistaken for one, which
+// means the entry before it declared the wrong size and the archive
+// has to be re-scanned. `BadHeaderChecksum` and `BadUstarMagic` are
+// therefore separate reasons rather than one "bad header".
+//
+// `TarSourceFailed` IS THE LAYER SEAM, and it is not called
+// `Transport`: csv-nv's `CsvError` already owns that constructor name
+// across the registry, and a variant constructor resolves by name
+// rather than by the type the expression needs.
+
+// Why a tar archive, or a request about one, could not be answered.
+//
+// ```novo
+// use tarerror
+//
+// fn main() [io]
+//     let e = BadUstarMagic(1204)
+//     println("block ${tarerror.block_of(e)}")
+// ```
+pub enum TarError
+    // A header block whose stored checksum does not match the one
+    // computed over it.  Both are carried because the difference is
+    // diagnostic: an off-by-a-small-amount is usually a writer that
+    // treated the checksum field as spaces incorrectly, and a wildly
+    // different value is a block that is not a header.
+    BadHeaderChecksum(block: Int, want: Int, got: Int)
+    // A block in a header position whose magic field is neither
+    // `ustar\0` + `00` (POSIX) nor `ustar  \0` (GNU) nor all zeroes.
+    // Almost always means the previous entry's size was wrong and the
+    // reader is looking at file data.
+    BadUstarMagic(block: Int)
+    // A numeric field — size, mode, uid, gid, mtime, devmajor,
+    // devminor — that is neither valid octal nor a valid base-256
+    // extension.  `field` names it and `text` is what was there, both
+    // because a malformed tar usually has exactly one bad field and
+    // the writer that produced it is identifiable from which.
+    BadNumericField(block: Int, field: Str, text: Str)
+    // The archive ended in the middle of a 512-byte block.  A byte
+    // offset rather than a block number, and the count actually
+    // available, because this is the one failure that is not
+    // block-aligned.
+    ShortBlock(offset: Int, got: Int)
+    // The archive ended while an entry still owed data, or in the
+    // middle of a PAX extended header.  Distinct from `ShortBlock`:
+    // the blocks were whole, there were just not enough of them.
+    UnexpectedEnd(offset: Int)
+    // A PAX extended header record that does not parse as
+    // `<len> <key>=<value>\n` — a length that is not a number, a
+    // length that does not match the record, a record with no `=`.
+    // `why` is prose because a malformed PAX record has no useful
+    // sub-structure left to name.
+    BadPaxRecord(block: Int, why: Str)
+    // A path or link target that will not fit the format being
+    // written: over 255 bytes for USTAR even after the prefix split,
+    // or a component over 100 bytes with no split point.  `cap` is
+    // the limit that was exceeded.  Writing PAX instead is the fix,
+    // and the message says so.
+    PathTooLong(path: Str, cap: Int)
+    // A numeric value too large for the field being written: over 8
+    // GiB for a USTAR size, a uid over 2,097,151, an mtime past
+    // 2242-03-16.  `field` names it and `value` is what was asked
+    // for.  PAX carries these without a limit, which is why the
+    // format choice is a writer argument.
+    FieldTooLarge(field: Str, value: Int)
+    // An entry kind this reader will not synthesise a path for: a GNU
+    // sparse entry, a volume header, a multi-volume continuation.
+    // The header is still returned — a caller can look at it and
+    // decide — but the reader will not pretend it knows what the
+    // entry's contents mean.  `kind` is the raw type byte.
+    UnsupportedEntryKind(block: Int, kind: Int)
+    // The stream underneath `tarread.read_all` failed.  The host's
+    // error, unmodified: this package does not know what a socket
+    // timing out means to the program that opened it.
+    TarSourceFailed(cause: IoError)
+
+// The one-line message, for a caller who is printing rather than
+// matching.
+//
+// `Result<T, TarError>` requires it — SPEC § 3.4 makes `Error` the
+// bound on a result's error type — so this impl exists whether or not
+// an interface release has anything to say yet, and its body is a
+// `todo()` like every other body here.
+impl Error for TarError
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("tar-nv.TarError.message")
+
+// The 0-based 512-byte block the error is about, or `-1` when it is
+// not about a place in the archive.
+//
+// `ShortBlock` and `UnexpectedEnd` carry byte offsets rather than
+// blocks — they are precisely the failures that are not
+// block-aligned — so this divides theirs by 512 and `byte_of` is the
+// accessor that does not lose the remainder. `PathTooLong`,
+// `FieldTooLarge` and `TarSourceFailed` answer `-1`: the first two are
+// faults in a write that has not happened yet, and the third never
+// reached a block.
+//
+// ```novo
+// use tarerror
+//
+// fn main() [io]
+//     println("${tarerror.block_of(PathTooLong("a/very/long/path", 255))}")   // -1
+// ```
+pub fn block_of(e: TarError) -> Int
+    todo("tar-nv.block_of")
+
+// The 0-based byte offset the error is about, or `-1` when it is not
+// about a place in the archive.
+//
+// The block number times 512 for everything block-aligned, and the
+// real offset for the two that are not — which is why both accessors
+// exist rather than one. A person about to `dd skip=` wants this one.
+//
+// ```novo
+// use tarerror
+//
+// fn main() [io]
+//     println("${tarerror.byte_of(BadUstarMagic(2))}")     // 1024
+// ```
+pub fn byte_of(e: TarError) -> Int
+    todo("tar-nv.byte_of")
+
+// Whether the archive can still be read past this error.
+//
+// A tar reader is unusually recoverable: the format is
+// self-delimiting at 512-byte boundaries, so a single corrupt header
+// can be skipped and the entries after it read normally — which is
+// what `tar --ignore-failed-read` does and what a person recovering a
+// backup wants. `BadHeaderChecksum`, `BadNumericField`,
+// `BadPaxRecord` and `UnsupportedEntryKind` say true; the two
+// truncations and a bad magic say false, because after those the
+// reader no longer knows where a block boundary is.
+//
+// ```novo
+// use tarerror
+//
+// fn main() [io]
+//     println("${tarerror.is_recoverable(BadHeaderChecksum(4, 1, 2))}")   // true
+// ```
+pub fn is_recoverable(e: TarError) -> Bool
+    todo("tar-nv.is_recoverable")

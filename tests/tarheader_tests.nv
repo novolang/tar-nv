@@ -1,0 +1,169 @@
+// tarheader_tests.nv — the API suite for the header value.
+//
+// RED ON PURPOSE: every body is a `todo()`.  See tar_tests.nv for why
+// an interface package ships a failing suite.
+//
+// What these assert is that the header is a VALUE — that its
+// constructors set what they say, that its builders change one field,
+// and that the two encodings a header block hides (the octal
+// numbers, the prefix/name split) never reach a caller.
+
+use std.test
+use tar
+use tarheader
+use tarerror
+
+@test
+fn test_a_file_header_has_the_ordinary_defaults() [io]
+    test.case("mode 420, no owner, no time, kind TarFile")
+    let h = tarheader.header("notes.txt", 12)
+    test.assert(h.path == "notes.txt")
+    test.assert(h.size == 12)
+    test.assert(h.mode == 420)
+    test.assert(h.uid == 0)
+    test.assert(h.gid == 0)
+    test.assert(h.mtime == 0)
+    test.assert(h.link == "")
+    test.assert(tarheader.kind_byte(h.kind) == 48)
+
+@test
+fn test_the_mtime_default_is_zero_because_there_is_no_clock() [io]
+    test.case("a core package cannot read one, so an archive is reproducible")
+    test.assert(tarheader.header("a", 1).mtime == 0)
+    test.assert(tarheader.directory("d").mtime == 0)
+
+@test
+fn test_a_directory_has_no_payload() [io]
+    test.case("size 0, mode 493, kind TarDirectory")
+    let d = tarheader.directory("src")
+    test.assert(d.size == 0)
+    test.assert(d.mode == 493)
+    test.assert(tarheader.kind_byte(d.kind) == 53)
+
+@test
+fn test_a_symlink_carries_its_target_out_of_band() [io]
+    test.case("the target is in link, not in data blocks")
+    let s = tarheader.symlink("latest", "v2.tar")
+    test.assert(s.link == "v2.tar")
+    test.assert(s.size == 0)
+    test.assert(tarheader.kind_byte(s.kind) == 50)
+
+@test
+fn test_every_builder_changes_one_field() [io]
+    let base = tarheader.header("a.txt", 10)
+
+    test.case("with_mode")
+    test.assert(tarheader.with_mode(base, 493).mode == 493)
+
+    test.case("with_mtime")
+    test.assert(tarheader.with_mtime(base, 1757376000).mtime == 1757376000)
+
+    test.case("with_owner")
+    let o = tarheader.with_owner(base, 1000, 20)
+    test.assert(o.uid == 1000)
+    test.assert(o.gid == 20)
+
+    test.case("with_owner_names")
+    let n = tarheader.with_owner_names(base, "klaus", "staff")
+    test.assert(n.uname == "klaus")
+    test.assert(n.gname == "staff")
+
+@test
+fn test_a_builder_leaves_the_other_fields_alone() [io]
+    test.case("with_mode does not move the size or the path")
+    let base = tarheader.header("a.txt", 10)
+    let h = tarheader.with_mode(base, 493)
+    test.assert(h.size == base.size)
+    test.assert(h.path == base.path)
+    test.assert(h.mtime == base.mtime)
+
+@test
+fn test_the_type_bytes_are_posixs() [io]
+    test.case("the typeflag characters, as their byte values")
+    test.assert(tarheader.kind_byte(TarFile) == 48)
+    test.assert(tarheader.kind_byte(TarHardLink) == 49)
+    test.assert(tarheader.kind_byte(TarSymlink) == 50)
+    test.assert(tarheader.kind_byte(TarCharDevice) == 51)
+    test.assert(tarheader.kind_byte(TarBlockDevice) == 52)
+    test.assert(tarheader.kind_byte(TarDirectory) == 53)
+    test.assert(tarheader.kind_byte(TarFifo) == 54)
+    test.assert(tarheader.kind_byte(TarPaxHeader) == 120)
+    test.assert(tarheader.kind_byte(TarGlobalPaxHeader) == 103)
+
+@test
+fn test_a_nul_typeflag_is_a_regular_file() [io]
+    test.case("the pre-POSIX spelling parses to the same kind as '0'")
+    test.assert(tarheader.kind_byte(tarheader.kind_of(0)) == 48)
+    test.assert(tarheader.kind_byte(tarheader.kind_of(48)) == 48)
+
+@test
+fn test_an_unknown_typeflag_keeps_its_byte() [io]
+    test.case("a GNU sparse entry is readable as itself, not guessed at")
+    match tarheader.kind_of(83)
+        TarUnknown(b) => test.assert(b == 83)
+        _             => test.fail("'S' was mapped onto a known kind")
+
+@test
+fn test_only_files_and_extended_headers_have_data() [io]
+    test.case("a reader that skipped size blocks after a link would desynchronise")
+    test.assert(tarheader.has_data(TarFile))
+    test.assert(tarheader.has_data(TarPaxHeader))
+    test.assert(tarheader.has_data(TarLongName))
+    test.assert(tarheader.has_data(TarDirectory) == false)
+    test.assert(tarheader.has_data(TarSymlink) == false)
+    test.assert(tarheader.has_data(TarFifo) == false)
+
+@test
+fn test_a_header_block_is_512_bytes() [io]
+    test.case("emit produces exactly one block")
+    match tarheader.emit(tarheader.header("notes.txt", 12), UstarFormat)
+        Ok(b)  => test.assert(bytes.len(b) == 512)
+        Err(_) => test.fail("a short path would not fit USTAR")
+
+@test
+fn test_v7_is_readable_and_not_writable() [io]
+    test.case("this package will not produce a pre-USTAR layout")
+    match tarheader.emit(tarheader.header("a.txt", 1), V7Format)
+        Ok(_)  => test.fail("a V7 header was written")
+        Err(_) => test.assert(true)
+
+@test
+fn test_parse_needs_a_whole_block() [io]
+    test.case("anything shorter than 512 bytes is a ShortBlock")
+    match tarheader.parse(bytes.from_str("ustar"), 0)
+        Ok(_)                     => test.fail("five bytes parsed as a header")
+        Err(ShortBlock(off, got)) =>
+            test.assert(off == 0)
+            test.assert(got == 5)
+        Err(_)                    => test.fail("refused for the wrong reason")
+
+@test
+fn test_a_short_path_fits_ustar_and_a_long_one_does_not() [io]
+    test.case("the question a writer asks before it chooses a format")
+    test.assert(tarheader.fits_ustar("src/main.nv"))
+
+@test
+fn test_the_checksum_of_a_zero_block_is_the_space_rule() [io]
+    test.case("eight spaces where the checksum field is: 8 * 32")
+    let zeros = bytes.slice(tar.end_of_archive(), 0, 512)
+    test.assert(tarheader.checksum(zeros) == 256)
+
+@test
+fn test_a_write_side_error_has_no_place_in_the_archive() [io]
+    test.case("PathTooLong and FieldTooLarge are faults in a write that has not happened")
+    test.assert(tarerror.block_of(PathTooLong("x", 255)) == -1)
+    test.assert(tarerror.byte_of(FieldTooLarge("size", 99)) == -1)
+
+@test
+fn test_a_block_number_and_a_byte_offset_agree() [io]
+    test.case("byte_of is block_of times 512 for anything block-aligned")
+    test.assert(tarerror.block_of(BadUstarMagic(2)) == 2)
+    test.assert(tarerror.byte_of(BadUstarMagic(2)) == 1024)
+
+@test
+fn test_local_corruption_is_recoverable_and_truncation_is_not() [io]
+    test.case("a bad header can be skipped; a lost block boundary cannot")
+    test.assert(tarerror.is_recoverable(BadHeaderChecksum(4, 1, 2)))
+    test.assert(tarerror.is_recoverable(BadNumericField(4, "size", "??")))
+    test.assert(tarerror.is_recoverable(UnexpectedEnd(2048)) == false)
+    test.assert(tarerror.is_recoverable(BadUstarMagic(4)) == false)

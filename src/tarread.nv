@@ -1,0 +1,354 @@
+// tarread.nv — the load-bearing interface: a tar reader that performs
+// nothing.
+//
+// THE SHAPE, AND WHY IT IS EVENTS RATHER THAN ENTRIES
+//
+// `tar-nv` is a `core` package, so its budget is no effects at all and
+// it may not open a file.  A tar archive is exactly the thing a caller
+// wants to stream, and it is usually far larger than memory — that is
+// what tar is FOR.  So the reader is a feed-and-drain state machine
+// whose output is a stream of EVENTS, not a list of entries:
+//
+//     var r = tarread.reader()
+//     let (r2, events) = tarread.feed(r, chunk)   // as many times as you like
+//     let rest = tarread.finish(r2)!              // once, at end of stream
+//
+// A list of entries would mean holding every file's contents at once,
+// which for a 40 GiB backup is not an API, it is a crash.  An event
+// stream lets a caller write each file out as its bytes arrive and
+// never hold more than a chunk:
+//
+//     for ev in events
+//         match ev
+//             TarHeaderSeen(entry) => ...open the output...
+//             TarDataSeen(chunk)   => ...write it...
+//             TarEntryDone         => ...close it...
+//             TarArchiveDone       => ...stop...
+//
+// A chunk may split anything — a header block, a file's data, the two
+// zero blocks at the end — and the reader carries whatever it could
+// not finish into the next call.  `feed` returns a NEW reader rather
+// than mutating one because `[mutate]` is a host effect and this
+// package has none.
+//
+// WHAT THE READER RESOLVES SO A CALLER DOES NOT HAVE TO
+//
+// Three of tar's four ways of storing a long path are invisible from
+// out here.  A `TarPaxHeader` (`x`) entry's records are parsed and
+// applied to the entry that follows; a `TarLongName` (`L`) or
+// `TarLongLink` (`K`) entry's data becomes the next entry's path or
+// link; a `TarGlobalPaxHeader` (`g`) entry's records are remembered
+// and applied to everything after it.  None of those four ever reaches
+// a caller as an event, because a caller who had to handle them would
+// be writing a tar reader.
+//
+// WHERE THE ARCHIVE ENDS
+//
+// Two consecutive zero blocks (POSIX.1-2017), which produce
+// `TarArchiveDone`.  What follows them is not read: GNU tar pads to a
+// 10,240-byte record and other writers concatenate archives, so bytes
+// after the end are normal.  `finish` on a reader that never saw the
+// two zero blocks is `UnexpectedEnd` — a truncated archive is the
+// commonest tar failure and it must not look like a complete one.
+
+// Something the reader found.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     match TarEntryDone
+//         TarEntryDone => println("one file finished")
+//         _            => println("something else")
+// ```
+pub enum TarEvent
+    // A new entry starts here.  Its path and link are already
+    // resolved — the PAX and GNU long-name mechanisms have been
+    // applied — and its records are whatever an extended header
+    // carried that this package did not consume itself.
+    TarHeaderSeen(entry: TarEntry)
+    // Some of the current entry's payload.  A chunk of arbitrary size,
+    // never padding: the up-to-511 bytes that pad an entry to a block
+    // boundary are consumed and never handed out.
+    TarDataSeen(chunk: Bytes)
+    // The current entry's payload is complete.  Emitted for every
+    // entry including the ones with no data at all, so a caller's
+    // open/write/close loop needs no special case for a directory.
+    TarEntryDone
+    // Two zero blocks: the archive is over.  Nothing after this is
+    // read, and a caller reading a concatenated file starts a new
+    // reader.
+    TarArchiveDone
+
+// One entry, as a caller meets it.
+//
+// A `TarHeader` plus what the extended headers said, which is a
+// different value from the header block on purpose: `header.path` is
+// what the 512 bytes contained, `path` here is what it MEANS after PAX
+// and GNU long names have had their say, and a caller wants the
+// second.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     println("${tarread.reader_format(tarread.reader())}")
+// ```
+pub struct TarEntry
+    // The header block's fields, as parsed, with PAX overrides
+    // already applied.
+    header: TarHeader
+    // The 0-based block the header sat at, for a caller building an
+    // index or reporting a position.
+    block: Int
+    // Extended-header records this package did NOT consume: vendor
+    // keys, `comment`, `atime`, `ctime`, anything it has no field
+    // for.  Kept rather than dropped, because a vendor key is the
+    // caller's business.
+    records: [PaxRecord]
+    // Which layout this entry was written in, so a caller
+    // re-archiving it can write the same one.
+    format: TarFormat
+
+// A reader at the start of an archive.
+//
+// No format argument: the reader accepts USTAR, PAX and V7 and works
+// out which from the magic field, because an archive does not
+// announce its format up front and a caller usually does not know.
+// The WRITER is the side that has to be told.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     println("${tarread.total_in(tarread.reader())}")     // 0
+// ```
+pub fn reader() -> TarReader
+    todo("tar-nv.reader")
+
+// A tar reader between chunks.
+//
+// Opaque in practice — the fields are here so the state is reviewable
+// rather than because a caller should read them.  The largest thing in
+// it is a partial 512-byte block plus whatever a pending extended
+// header holds, which is what keeps a reader affordable on a device
+// however large the archive is.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     println("${tarread.entries_seen(tarread.reader())}")     // 0
+// ```
+pub struct TarReader
+    // Where the machine is: expecting a header, inside an entry's
+    // data, eating padding, collecting an extended header, or done.
+    state: Int
+    // Bytes of a 512-byte block that have arrived but not completed
+    // one.  Never more than 511.
+    partial: Bytes
+    // Bytes consumed so far, across every `feed`.
+    consumed: Int
+    // The 0-based block index the next whole block will be.
+    block: Int
+    // How many payload bytes the current entry still owes, padding
+    // excluded.
+    owed: Int
+    // How many padding bytes are still to be eaten before the next
+    // header.
+    pad: Int
+    // How many entries have been HANDED OUT — the four consumed kinds
+    // do not count, so this matches what a caller saw.
+    entries: Int
+    // The format the last header was written in.
+    format: TarFormat
+    // Records from a `TarPaxHeader` entry, waiting for the entry they
+    // apply to.
+    pending: [PaxRecord]
+    // Records from a `TarGlobalPaxHeader`, applying to everything
+    // after it until another replaces them.
+    globals: [PaxRecord]
+    // A path from a `TarLongName` entry, waiting for its entry; empty
+    // when there is none.
+    long_name: Str
+    // A link target from a `TarLongLink` entry; empty when there is
+    // none.
+    long_link: Str
+    // The sticky failure, or absent.
+    failure: ?TarError
+
+// Feed the next chunk; get back the reader to feed the chunk after it,
+// and everything those bytes revealed.
+//
+// An empty chunk is legal and reveals nothing — it is NOT an
+// end-of-stream signal, because a caller reading a socket gets empty
+// reads for reasons that are not the end. `finish` is the
+// end-of-stream signal.
+//
+// A failure does not discard the events already produced from this
+// chunk: they are returned, the reader is left failed, and `error`
+// says why and where. Which matters more here than in most formats,
+// because tar corruption is usually local — `tarerror.is_recoverable`
+// is the question a recovery tool asks next.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     let (_, evs) = tarread.feed(tarread.reader(), bytes.from_str(""))
+//     println("${list.len(evs)}")                          // 0
+// ```
+pub fn feed(r: TarReader, chunk: Bytes) -> (TarReader, [TarEvent])
+    todo("tar-nv.feed")
+
+// End of stream: whatever the last bytes completed, and the verdict.
+//
+// `Err(UnexpectedEnd)` when the archive stopped mid-entry or before
+// the two zero blocks — which is the commonest tar failure there is,
+// and the one a caller most needs told rather than guessed at. `Ok`
+// with an empty list for an archive that ended properly and whose last
+// event was already `TarArchiveDone`.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     match tarread.finish(tarread.reader())
+//         Ok(_)  => println("complete")
+//         Err(_) => println("truncated")                   // this one
+// ```
+pub fn finish(r: TarReader) -> Result<[TarEvent], TarError>
+    todo("tar-nv.finish")
+
+// The sticky failure this reader is carrying, or `None`.
+//
+// Once set it is never cleared. Recovering from a corrupt tar means
+// re-scanning for the next plausible header, which is a policy — how
+// far to look, what counts as plausible — and a policy belongs to the
+// caller rather than in a decoder that would be guessing.
+// `tarerror.is_recoverable` says whether such a re-scan is worth
+// attempting.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     match tarread.error(tarread.reader())
+//         Some(_) => println("failed")
+//         None    => println("fine")                       // this one
+// ```
+pub fn error(r: TarReader) -> ?TarError
+    todo("tar-nv.error")
+
+// Whether the two zero blocks have been seen.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     println("${tarread.is_done(tarread.reader())}")      // false
+// ```
+pub fn is_done(r: TarReader) -> Bool
+    todo("tar-nv.is_done")
+
+// Bytes consumed so far, across every `feed`.
+//
+// Divided by 512 this is the reader's block position, which is what a
+// caller building a seek index records against each entry.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     println("${tarread.total_in(tarread.reader())}")     // 0
+// ```
+pub fn total_in(r: TarReader) -> Int
+    todo("tar-nv.total_in")
+
+// How many entries have been handed out.
+//
+// The four consumed kinds — `x`, `g`, `L`, `K` — do not count, so this
+// is the number a caller has seen and not the number of header blocks
+// in the file.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     println("${tarread.entries_seen(tarread.reader())}")     // 0
+// ```
+pub fn entries_seen(r: TarReader) -> Int
+    todo("tar-nv.entries_seen")
+
+// The format the last header was written in.
+//
+// `PaxFormat` on a fresh reader, which is a default and not a claim —
+// nothing has been read yet.
+//
+// ```novo
+// use tarread
+// use tar
+//
+// fn main() [io]
+//     println("${tar.format_name(tarread.reader_format(tarread.reader()))}")
+// ```
+pub fn reader_format(r: TarReader) -> TarFormat
+    todo("tar-nv.reader_format")
+
+// Read a whole archive's ENTRY LIST, and be charged exactly what the
+// stream costs.
+//
+// THE EFFECT-POLYMORPHIC SIGNATURE OF THIS PACKAGE.  `S: Read[e]`
+// binds the effect parameter of the standard library's `Read` trait
+// and the clause is `[e]`, so the row means "whatever the impl behind
+// `S` supplies" — the call site substitutes it, a `File` charges its
+// caller `[io]`, an in-memory `Buffer` charges nothing, and this
+// package remains `core` because it has not named an effect of its own
+// (SPEC § 5.6, and `docs/publishing.md` § Design).
+//
+// **It returns the entries and DISCARDS the payloads.** That is the
+// deliberate difference from csv-nv's `read_all`, and it is the shape
+// tar forces: an archive is routinely larger than memory, so a
+// convenience that materialised every file's bytes would be a
+// convenience that crashes on the archives people actually have. This
+// is `tar t`, not `tar x`. A caller who wants the bytes uses `feed`,
+// which is what `archive-nv` does.
+//
+// A stream failure comes back as `TarSourceFailed` carrying the host's
+// own `IoError`.
+//
+// ```novo
+// use tarread
+//
+// fn list_archive(path: Str) -> Result<[TarEntry], TarError> [io, fs]
+//     match File.open_read(path)
+//         None    => Err(TarSourceFailed(IoNotFound))
+//         Some(f) =>
+//             let h: File = f
+//             tarread.read_all(h)
+//
+// fn main() [io, fs]
+//     match list_archive("backup.tar")
+//         Ok(es) => println("${list.len(es)} entries")
+//         Err(e) => println(e.message())
+// ```
+pub fn read_all<S: Read[e]>(src: S) -> Result<[TarEntry], TarError> [e]
+    todo("tar-nv.read_all")
+
+// Every entry in an archive already in memory, payloads discarded.
+//
+// `reader` + one `feed` + `finish`, with the same "this is `tar t`"
+// caveat as `read_all`. For a small archive a caller genuinely has in
+// a buffer, which is the case `zip-nv`'s tests and a package installer
+// both have.
+//
+// ```novo
+// use tarread
+//
+// fn main() [io]
+//     match tarread.list(bytes.from_str(""))
+//         Ok(_)  => println("listed")
+//         Err(_) => println("truncated")                   // this one
+// ```
+pub fn list(data: Bytes) -> Result<[TarEntry], TarError>
+    todo("tar-nv.list")
