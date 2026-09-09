@@ -1,6 +1,6 @@
 [package]
 name        = "tar-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "USTAR and PAX tar archives as arithmetic over 512-byte blocks, with no filesystem anywhere: a header value with every field typed rather than a blob, a feed-and-drain reader that emits events so an archive larger than memory still streams, a writer that returns blocks, PAX extended records for the paths and sizes USTAR cannot hold, POSIX's checksum rule, and the two-zero-block end."
 license     = "Apache-2.0"
 
@@ -27,6 +27,7 @@ category    = "compression"
 tags        = ["tar", "ustar", "pax", "archive", "posix", "sans-io", "tarball"]
 repository  = "https://github.com/novolang/tar-nv"
 maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.
