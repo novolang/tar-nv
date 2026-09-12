@@ -1,6 +1,6 @@
 [package]
 name        = "tar-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "USTAR and PAX tar archives as arithmetic over 512-byte blocks, with no filesystem anywhere: a header value with every field typed rather than a blob, a feed-and-drain reader that emits events so an archive larger than memory still streams, a writer that returns blocks, PAX extended records for the paths and sizes USTAR cannot hold, POSIX's checksum rule, and the two-zero-block end."
 license     = "Apache-2.0"
 
