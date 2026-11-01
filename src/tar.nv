@@ -34,6 +34,8 @@
 // `PathTooLong` and `FieldTooLarge` are the two errors that say the
 // caller chose USTAR and then handed it something that does not fit.
 
+const BLOCK = 512
+
 // Which layout a writer emits, and which one a reader found.
 //
 // ```novo
@@ -68,7 +70,10 @@ pub enum TarFormat
 //     println("${tar.format_name(UstarFormat)}")       // ustar
 // ```
 pub fn format_name(f: TarFormat) -> Str
-    todo("tar-nv.format_name")
+    match f
+        UstarFormat => "ustar"
+        PaxFormat   => "pax"
+        V7Format    => "v7"
 
 // 512 — the block size, and the only number in the format.
 //
@@ -83,7 +88,7 @@ pub fn format_name(f: TarFormat) -> Str
 //     println("${tar.block_size()}")                   // 512
 // ```
 pub fn block_size() -> Int
-    todo("tar-nv.block_size")
+    BLOCK
 
 // How many 512-byte blocks a payload of `size` bytes occupies.
 //
@@ -99,7 +104,9 @@ pub fn block_size() -> Int
 //     println("${tar.blocks_for(0)}")                  // 0
 // ```
 pub fn blocks_for(size: Int) -> Int
-    todo("tar-nv.blocks_for")
+    if size <= 0
+        return 0
+    (size + BLOCK - 1) / BLOCK
 
 // How many padding bytes follow a payload of `size` bytes.
 //
@@ -116,7 +123,9 @@ pub fn blocks_for(size: Int) -> Int
 //     println("${tar.padding_for(0)}")                 // 0
 // ```
 pub fn padding_for(size: Int) -> Int
-    todo("tar-nv.padding_for")
+    if size <= 0
+        return 0
+    (BLOCK - size % BLOCK) % BLOCK
 
 // Whether a 512-byte block is all zeroes.
 //
@@ -136,7 +145,12 @@ pub fn padding_for(size: Int) -> Int
 //     println("${tar.is_zero_block(bytes.from_str(""))}")   // false — too short
 // ```
 pub fn is_zero_block(block: Bytes) -> Bool
-    todo("tar-nv.is_zero_block")
+    if bytes.len(block) != BLOCK
+        return false
+    for i in 0..BLOCK
+        if (bytes.byte_at(block, i) ?? 1) != 0
+            return false
+    true
 
 // The two zero blocks that end an archive: 1,024 bytes.
 //
@@ -154,4 +168,4 @@ pub fn is_zero_block(block: Bytes) -> Bool
 //     println("${bytes.len(tar.end_of_archive())}")    // 1024
 // ```
 pub fn end_of_archive() -> Bytes
-    todo("tar-nv.end_of_archive")
+    bytes.zeros(2 * BLOCK)

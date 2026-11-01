@@ -44,7 +44,9 @@
 // ```
 pub enum TarError
     // A header block whose stored checksum does not match the one
-    // computed over it.  Both are carried because the difference is
+    // computed over it.  `want` is the sum computed over the block and
+    // `got` is the value its checksum field stores.  Both are carried
+    // because the difference is
     // diagnostic: an off-by-a-small-amount is usually a writer that
     // treated the checksum field as spaces incorrectly, and a wildly
     // different value is a block that is not a header.
@@ -76,7 +78,7 @@ pub enum TarError
     // sub-structure left to name.
     BadPaxRecord(block: Int, why: Str)
     // A path or link target that will not fit the format being
-    // written: over 255 bytes for USTAR even after the prefix split,
+    // written: over 256 bytes for USTAR (155 of prefix, a slash, 100 of name),
     // or a component over 100 bytes with no split point.  `cap` is
     // the limit that was exceeded.  Writing PAX instead is the fix,
     // and the message says so.
@@ -102,13 +104,15 @@ pub enum TarError
 // matching.
 //
 // `Result<T, TarError>` requires it — SPEC § 3.4 makes `Error` the
-// bound on a result's error type — so this impl exists whether or not
-// an interface release has anything to say yet, and its body is a
-// `todo()` like every other body here.
+// bound on a result's error type.
 impl Error for TarError
-    // Panics with `not implemented` until the bodies land.
+    // The sentence names the block, or the byte offset, and what was
+    // wrong there.
     fn message(self) -> Str
-        todo("tar-nv.TarError.message")
+        let at = byte_of(self)
+        if at < 0
+            return reason_of(self)
+        "at byte ${at}: ${reason_of(self)}"
 
 // The 0-based 512-byte block the error is about, or `-1` when it is
 // not about a place in the archive.
@@ -125,10 +129,20 @@ impl Error for TarError
 // use tarerror
 //
 // fn main() [io]
-//     println("${tarerror.block_of(PathTooLong("a/very/long/path", 255))}")   // -1
+//     println("${tarerror.block_of(PathTooLong("a/very/long/path", 256))}")   // -1
 // ```
 pub fn block_of(e: TarError) -> Int
-    todo("tar-nv.block_of")
+    match e
+        BadHeaderChecksum(b, _, _) => b
+        BadUstarMagic(b)           => b
+        BadNumericField(b, _, _)   => b
+        ShortBlock(off, _)         => off / 512
+        UnexpectedEnd(off)         => off / 512
+        BadPaxRecord(b, _)         => b
+        PathTooLong(_, _)          => -1
+        FieldTooLarge(_, _)        => -1
+        UnsupportedEntryKind(b, _) => b
+        TarSourceFailed(_)         => -1
 
 // The 0-based byte offset the error is about, or `-1` when it is not
 // about a place in the archive.
@@ -144,7 +158,14 @@ pub fn block_of(e: TarError) -> Int
 //     println("${tarerror.byte_of(BadUstarMagic(2))}")     // 1024
 // ```
 pub fn byte_of(e: TarError) -> Int
-    todo("tar-nv.byte_of")
+    match e
+        ShortBlock(off, _) => off
+        UnexpectedEnd(off) => off
+        _                  =>
+            let b = block_of(e)
+            if b < 0
+                return -1
+            b * 512
 
 // Whether the archive can still be read past this error.
 //
@@ -164,4 +185,23 @@ pub fn byte_of(e: TarError) -> Int
 //     println("${tarerror.is_recoverable(BadHeaderChecksum(4, 1, 2))}")   // true
 // ```
 pub fn is_recoverable(e: TarError) -> Bool
-    todo("tar-nv.is_recoverable")
+    match e
+        BadHeaderChecksum(_, _, _) => true
+        BadNumericField(_, _, _)   => true
+        BadPaxRecord(_, _)         => true
+        UnsupportedEntryKind(_, _) => true
+        _                          => false
+
+// The part of the message after the position.
+fn reason_of(e: TarError) -> Str
+    match e
+        BadHeaderChecksum(_, want, got) => "header checksum is ${got}, the block adds up to ${want}"
+        BadUstarMagic(b)                => "block ${b} is not a tar header: its magic field is neither ustar nor zero"
+        BadNumericField(_, field, text) => "the ${field} field holds '${text}', which is neither octal nor base-256"
+        ShortBlock(_, got)              => "the archive ends after ${got} byte(s) of a 512-byte block"
+        UnexpectedEnd(_)                => "the archive ends before its two zero blocks or inside an entry"
+        BadPaxRecord(_, why)            => "bad extended header record: ${why}"
+        PathTooLong(path, cap)          => "the path '${path}' does not fit the format: the limit is ${cap} bytes, write the PAX format instead"
+        FieldTooLarge(field, value)     => "the ${field} value ${value} cannot be written here: a USTAR field is too small for it, or the call is out of order"
+        UnsupportedEntryKind(_, kind)   => "entry type byte ${kind} is not supported"
+        TarSourceFailed(c)              => "the source failed: ${c.message()}"

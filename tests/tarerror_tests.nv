@@ -1,0 +1,53 @@
+// tarerror_tests.nv — every error says where it happened and what was
+// wrong, and says whether the archive can be read past it.
+
+use std.test
+use tarerror
+
+fn all_errors() -> [TarError]
+    [BadHeaderChecksum(2, 100, 90), BadUstarMagic(3), BadNumericField(4, "size", "zz"),
+     ShortBlock(1034, 10), UnexpectedEnd(2048), BadPaxRecord(5, "no key"),
+     PathTooLong("a/b", 256), FieldTooLarge("size", 9), UnsupportedEntryKind(6, 83),
+     TarSourceFailed(IoNotFound)]
+
+@test
+fn test_every_error_has_a_message() [io]
+    for e in all_errors()
+        test.assert(str.len(e.message()) > 10)
+
+@test
+fn test_a_message_with_a_position_leads_with_the_byte_offset() [io]
+    test.assert(str.starts_with(BadUstarMagic(3).message(), "at byte 1536: "))
+    test.assert(str.starts_with(ShortBlock(1034, 10).message(), "at byte 1034: "))
+    test.assert(str.starts_with(PathTooLong("a", 256).message(), "the path"))
+
+@test
+fn test_the_message_carries_the_values() [io]
+    test.assert(str.contains(BadHeaderChecksum(2, 100, 90).message(), "90"))
+    test.assert(str.contains(BadHeaderChecksum(2, 100, 90).message(), "100"))
+    test.assert(str.contains(BadNumericField(4, "size", "zz").message(), "zz"))
+    test.assert(str.contains(BadPaxRecord(5, "no key").message(), "no key"))
+    test.assert(str.contains(UnsupportedEntryKind(6, 83).message(), "83"))
+    test.assert(str.contains(FieldTooLarge("size", 9).message(), "size"))
+    test.assert(str.contains(PathTooLong("a/b", 256).message(), "a/b"))
+
+@test
+fn test_positions() [io]
+    test.assert(tarerror.block_of(BadHeaderChecksum(2, 1, 2)) == 2)
+    test.assert(tarerror.block_of(BadNumericField(4, "x", "y")) == 4)
+    test.assert(tarerror.block_of(ShortBlock(1034, 10)) == 2)
+    test.assert(tarerror.block_of(UnexpectedEnd(2048)) == 4)
+    test.assert(tarerror.block_of(BadPaxRecord(5, "x")) == 5)
+    test.assert(tarerror.block_of(UnsupportedEntryKind(6, 83)) == 6)
+    test.assert(tarerror.byte_of(ShortBlock(1034, 10)) == 1034)
+    test.assert(tarerror.byte_of(UnexpectedEnd(2048)) == 2048)
+    test.assert(tarerror.byte_of(BadPaxRecord(5, "x")) == 2560)
+    test.assert(tarerror.byte_of(PathTooLong("x", 1)) == -1)
+
+@test
+fn test_recoverability() [io]
+    test.assert(tarerror.is_recoverable(BadPaxRecord(5, "x")))
+    test.assert(tarerror.is_recoverable(UnsupportedEntryKind(6, 83)))
+    test.assert(tarerror.is_recoverable(ShortBlock(1, 1)) == false)
+    test.assert(tarerror.is_recoverable(PathTooLong("x", 1)) == false)
+    test.assert(tarerror.is_recoverable(FieldTooLarge("x", 1)) == false)
