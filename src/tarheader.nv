@@ -443,12 +443,14 @@ pub fn parse(block: Bytes, index: Int) -> Result<(TarHeader, TarFormat), TarErro
 // prefix/name split is found here too.
 //
 // `PathTooLong` or `FieldTooLarge` when the format cannot carry what
-// the header says: a full over 255 bytes or with no split point under
-// `UstarFormat`, a size over 8 GiB, a uid over 2,097,151. Under
-// `PaxFormat` none of those can happen in this block — they move to
-// the extended header, and `tarwrite.write_entry` is what puts them
-// there. Under `V7Format` this always refuses: the layout is
-// readable and this package will not write it.
+// the header says: a path over 256 bytes or with no split point, a link
+// target over 100 bytes, a user or group name over 32 bytes, a size over
+// 8 GiB, a uid over 2,097,151, under `UstarFormat`.  Under `PaxFormat`
+// none of those can happen in this block.  A name is cut to fit, a number
+// octal cannot hold is written as base-256, and `tarwrite.write_header`
+// puts the real values in the extended header before it.  Under
+// `V7Format` this always refuses: the layout is readable and this package
+// will not write it.
 //
 // ```novo
 // use tarheader
