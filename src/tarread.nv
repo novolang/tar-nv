@@ -51,6 +51,11 @@
 // two zero blocks is `UnexpectedEnd` — a truncated archive is the
 // commonest tar failure and it must not look like a complete one.
 
+use tar
+use tarerror
+use tarheader
+use pax
+
 // Something the reader found.
 //
 // ```novo
@@ -124,7 +129,9 @@ pub struct TarEntry
 //     println("${tarread.total_in(tarread.reader())}")     // 0
 // ```
 pub fn reader() -> TarReader
-    todo("tar-nv.reader")
+    TarReader { state: STATE_HEADER, partial: bytes.zeros(0), consumed: 0, block: 0,
+                owed: 0, pad: 0, entries: 0, format: PaxFormat, pending: [], globals: [],
+                long_name: "", long_link: "", ext: bytes.zeros(0), failure: None }
 
 // A tar reader between chunks.
 //
@@ -174,6 +181,9 @@ pub struct TarReader
     // A link target from a `TarLongLink` entry; empty when there is
     // none.
     long_link: Str
+    // The payload of an extended header, a global header or a long name
+    // collected so far, empty at any other time.
+    ext: Bytes
     // The sticky failure, or absent.
     failure: ?TarError
 
@@ -199,7 +209,11 @@ pub struct TarReader
 //     println("${list.len(evs)}")                          // 0
 // ```
 pub fn feed(r: TarReader, chunk: Bytes) -> (TarReader, [TarEvent])
-    todo("tar-nv.feed")
+    if r.failure != None or r.state == STATE_DONE
+        return (r, [])
+    var c = open_work(r, chunk)
+    drain(var c)
+    (close_work(c), c.events)
 
 // End of stream: whatever the last bytes completed, and the verdict.
 //
@@ -218,7 +232,16 @@ pub fn feed(r: TarReader, chunk: Bytes) -> (TarReader, [TarEvent])
 //         Err(_) => println("truncated")                   // this one
 // ```
 pub fn finish(r: TarReader) -> Result<[TarEvent], TarError>
-    todo("tar-nv.finish")
+    match r.failure
+        Some(e) =>
+            return Err(e)
+        None    => 0
+    if r.state == STATE_DONE
+        return Ok([])
+    let held = bytes.len(r.partial)
+    if held > 0
+        return Err(ShortBlock(r.consumed - held, held))
+    Err(UnexpectedEnd(r.consumed))
 
 // The sticky failure this reader is carrying, or `None`.
 //
@@ -238,7 +261,7 @@ pub fn finish(r: TarReader) -> Result<[TarEvent], TarError>
 //         None    => println("fine")                       // this one
 // ```
 pub fn error(r: TarReader) -> ?TarError
-    todo("tar-nv.error")
+    r.failure
 
 // Whether the two zero blocks have been seen.
 //
@@ -249,7 +272,7 @@ pub fn error(r: TarReader) -> ?TarError
 //     println("${tarread.is_done(tarread.reader())}")      // false
 // ```
 pub fn is_done(r: TarReader) -> Bool
-    todo("tar-nv.is_done")
+    r.state == STATE_DONE
 
 // Bytes consumed so far, across every `feed`.
 //
@@ -263,7 +286,7 @@ pub fn is_done(r: TarReader) -> Bool
 //     println("${tarread.total_in(tarread.reader())}")     // 0
 // ```
 pub fn total_in(r: TarReader) -> Int
-    todo("tar-nv.total_in")
+    r.consumed
 
 // How many entries have been handed out.
 //
@@ -278,7 +301,7 @@ pub fn total_in(r: TarReader) -> Int
 //     println("${tarread.entries_seen(tarread.reader())}")     // 0
 // ```
 pub fn entries_seen(r: TarReader) -> Int
-    todo("tar-nv.entries_seen")
+    r.entries
 
 // The format the last header was written in.
 //
@@ -293,7 +316,7 @@ pub fn entries_seen(r: TarReader) -> Int
 //     println("${tar.format_name(tarread.reader_format(tarread.reader()))}")
 // ```
 pub fn reader_format(r: TarReader) -> TarFormat
-    todo("tar-nv.reader_format")
+    r.format
 
 // Read a whole archive's ENTRY LIST, and be charged exactly what the
 // stream costs.
@@ -333,7 +356,27 @@ pub fn reader_format(r: TarReader) -> TarFormat
 //         Err(e) => println(e.message())
 // ```
 pub fn read_all<S: Read[e]>(src: S) -> Result<[TarEntry], TarError> [e]
-    todo("tar-nv.read_all")
+    var r = reader()
+    var entries: [TarEntry] = []
+    var reading = true
+    while reading
+        match src.read(65536)
+            Ok(chunk)  =>
+                if bytes.len(chunk) == 0
+                    reading = false
+                else
+                    let (next, events) = feed(r, chunk)
+                    r = next
+                    collect_entries(var entries, events)
+                    match r.failure
+                        Some(e) =>
+                            return Err(e)
+                        None    => 0
+            Err(cause) =>
+                return Err(TarSourceFailed(cause))
+    match finish(r)
+        Ok(_)  => Ok(entries)
+        Err(e) => Err(e)
 
 // Every entry in an archive already in memory, payloads discarded.
 //
@@ -351,4 +394,273 @@ pub fn read_all<S: Read[e]>(src: S) -> Result<[TarEntry], TarError> [e]
 //         Err(_) => println("truncated")                   // this one
 // ```
 pub fn list(data: Bytes) -> Result<[TarEntry], TarError>
-    todo("tar-nv.list")
+    let (r, events) = feed(reader(), data)
+    var entries: [TarEntry] = []
+    collect_entries(var entries, events)
+    match finish(r)
+        Ok(_)  => Ok(entries)
+        Err(e) => Err(e)
+
+// The states of the reader.  A header is expected in `STATE_HEADER` and,
+// after a lone zero block, in `STATE_ZERO`; the payload of an entry
+// follows in `STATE_DATA`, then its padding in `STATE_PAD`.  The payload
+// of an extended header, a global header or a long name is gathered in
+// the four `STATE_EXT_*` states.
+const STATE_HEADER = 0
+const STATE_DATA = 1
+const STATE_PAD = 2
+const STATE_EXT_PAX = 3
+const STATE_EXT_GLOBAL = 4
+const STATE_EXT_NAME = 5
+const STATE_EXT_LINK = 6
+const STATE_DONE = 7
+const STATE_ZERO = 8
+
+// The most an extended header, a global header or a long name may hold.
+// The payload is kept in memory, so a header that claims more is refused.
+const EXT_LIMIT = 1048576
+
+// The work of one `feed`: the input in hand, the events being built and
+// the reader's registers, all writable so that the steps below advance
+// them in place.  `close_work` turns it back into a `TarReader`.
+struct Work
+    src: Bytes
+    var pos: Int
+    var state: Int
+    var partial: Bytes
+    var consumed: Int
+    var owed: Int
+    var pad: Int
+    var entries: Int
+    var format: TarFormat
+    var pending: [PaxRecord]
+    var globals: [PaxRecord]
+    var long_name: Str
+    var long_link: Str
+    var ext: Bytes
+    var events: [TarEvent]
+    var failure: ?TarError
+
+fn open_work(r: TarReader, src: Bytes) -> Work
+    Work { src: src, pos: 0, state: r.state, partial: bytes.clone(r.partial), consumed: r.consumed,
+           owed: r.owed, pad: r.pad, entries: r.entries, format: r.format,
+           pending: r.pending[:], globals: r.globals[:], long_name: r.long_name,
+           long_link: r.long_link, ext: bytes.clone(r.ext), events: [], failure: None }
+
+fn close_work(c: Work) -> TarReader
+    TarReader { state: c.state, partial: c.partial, consumed: c.consumed,
+                block: c.consumed / 512, owed: c.owed, pad: c.pad, entries: c.entries,
+                format: c.format, pending: c.pending, globals: c.globals,
+                long_name: c.long_name, long_link: c.long_link, ext: c.ext,
+                failure: c.failure }
+
+// Run the machine until the input is used up, the archive ends or a
+// failure is recorded.
+fn drain(var c: Work)
+    let n = bytes.len(c.src)
+    while c.pos < n and c.failure == None and c.state != STATE_DONE
+        if c.state == STATE_DATA
+            step_data(var c)
+        else if c.state == STATE_PAD
+            step_pad(var c)
+        else if c.state == STATE_HEADER or c.state == STATE_ZERO
+            step_header(var c)
+        else
+            step_ext(var c)
+
+fn min_int(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+fn fail(var c: Work, e: TarError)
+    c.failure = Some(e)
+
+// Hand out as much of the entry's payload as the input holds.
+fn step_data(var c: Work)
+    let take = min_int(c.owed, bytes.len(c.src) - c.pos)
+    list.push(c.events, TarDataSeen(bytes.slice(c.src, c.pos, c.pos + take)))
+    c.pos = c.pos + take
+    c.consumed = c.consumed + take
+    c.owed = c.owed - take
+    if c.owed == 0
+        finish_payload(var c)
+        list.push(c.events, TarEntryDone)
+
+// Skip the padding that takes a payload to a block boundary.
+fn step_pad(var c: Work)
+    let take = min_int(c.pad, bytes.len(c.src) - c.pos)
+    c.pos = c.pos + take
+    c.consumed = c.consumed + take
+    c.pad = c.pad - take
+    if c.pad == 0
+        c.state = STATE_HEADER
+
+// A payload is complete: what follows is its padding.
+fn finish_payload(var c: Work)
+    c.state = STATE_PAD
+    if c.pad == 0
+        c.state = STATE_HEADER
+
+// Gather the payload of an extended header, a global header or a long
+// name, and use it once it is whole.
+fn step_ext(var c: Work)
+    let take = min_int(c.owed, bytes.len(c.src) - c.pos)
+    c.ext = bytes.concat([c.ext, bytes.slice(c.src, c.pos, c.pos + take)])
+    c.pos = c.pos + take
+    c.consumed = c.consumed + take
+    c.owed = c.owed - take
+    if c.owed > 0
+        return
+    let kind = c.state
+    let data = c.ext
+    c.ext = bytes.zeros(0)
+    finish_payload(var c)
+    let at = (c.consumed - bytes.len(data)) / 512 - 1
+    if kind == STATE_EXT_NAME
+        c.long_name = name_of(data)
+    else if kind == STATE_EXT_LINK
+        c.long_link = name_of(data)
+    else
+        match pax.parse_records(data, at)
+            Ok(rs) =>
+                if kind == STATE_EXT_PAX
+                    c.pending = rs[:]
+                else
+                    c.globals = merge(c.globals, rs)
+            Err(e) => fail(var c, e)
+
+// A long name's payload: the text up to its NUL.
+fn name_of(data: Bytes) -> Str
+    let end = bytes.find_byte(data, 0, 0) ?? bytes.len(data)
+    bytes.to_str(bytes.slice(data, 0, end))
+
+// Global records with newer ones laid over them.
+fn merge(older: [PaxRecord], newer: [PaxRecord]) -> [PaxRecord]
+    list.concat(older, newer)
+
+// Collect a header block and act on it.
+fn step_header(var c: Work)
+    let n = bytes.len(c.src)
+    var block = bytes.zeros(0)
+    let held = bytes.len(c.partial)
+    if held == 0 and n - c.pos >= 512
+        block = bytes.slice(c.src, c.pos, c.pos + 512)
+        c.pos = c.pos + 512
+        c.consumed = c.consumed + 512
+    else
+        let take = min_int(512 - held, n - c.pos)
+        c.partial = bytes.concat([c.partial, bytes.slice(c.src, c.pos, c.pos + take)])
+        c.pos = c.pos + take
+        c.consumed = c.consumed + take
+        if bytes.len(c.partial) < 512
+            return
+        block = c.partial
+        c.partial = bytes.zeros(0)
+    take_block(var c, block)
+
+fn take_block(var c: Work, block: Bytes)
+    let index = c.consumed / 512 - 1
+    if tar.is_zero_block(block)
+        if c.state == STATE_ZERO
+            c.state = STATE_DONE
+            list.push(c.events, TarArchiveDone)
+        else
+            c.state = STATE_ZERO
+        return
+    c.state = STATE_HEADER
+    match tarheader.parse(block, index)
+        Err(e)        => fail(var c, e)
+        Ok((h, form)) => take_header(var c, h, form, index)
+
+fn take_header(var c: Work, h: TarHeader, form: TarFormat, index: Int)
+    c.format = form
+    match h.kind
+        TarPaxHeader       => begin_ext(var c, h, STATE_EXT_PAX, index)
+        TarGlobalPaxHeader => begin_ext(var c, h, STATE_EXT_GLOBAL, index)
+        TarLongName        => begin_ext(var c, h, STATE_EXT_NAME, index)
+        TarLongLink        => begin_ext(var c, h, STATE_EXT_LINK, index)
+        _                  => begin_entry(var c, h, form, index)
+
+// An extended header, a global header or a long name starts: gather its
+// payload.  A payload of nothing has nothing to gather.
+fn begin_ext(var c: Work, h: TarHeader, state: Int, index: Int)
+    if h.size > EXT_LIMIT or h.size < 0
+        fail(var c,
+            BadPaxRecord(index, "an extended header of ${h.size} bytes is over the limit of ${EXT_LIMIT}"))
+        return
+    c.state = state
+    c.owed = h.size
+    c.pad = tar.padding_for(h.size)
+    c.ext = bytes.zeros(0)
+    if h.size == 0
+        step_ext_empty(var c)
+
+fn step_ext_empty(var c: Work)
+    let kind = c.state
+    finish_payload(var c)
+    if kind == STATE_EXT_NAME
+        c.long_name = ""
+    else if kind == STATE_EXT_LINK
+        c.long_link = ""
+    else if kind == STATE_EXT_PAX
+        c.pending = []
+    else
+        c.globals = []
+
+// A real entry: lay the long names, the global records and the pending
+// records over its header, hand it out and set up its payload.  A file
+// whose path ends in a slash is a directory, which is how writers that
+// predate the directory type flag mark one.
+fn begin_entry(var c: Work, h: TarHeader, form: TarFormat, index: Int)
+    var header = h
+    var used = form
+    if str.len(c.long_name) > 0
+        header = TarHeader { path: c.long_name, mode: header.mode, uid: header.uid, gid: header.gid,
+                             size: header.size, mtime: header.mtime, kind: header.kind,
+                             link: header.link, uname: header.uname, gname: header.gname,
+                             devmajor: header.devmajor, devminor: header.devminor }
+    if str.len(c.long_link) > 0
+        header = TarHeader { path: header.path, mode: header.mode, uid: header.uid, gid: header.gid,
+                             size: header.size, mtime: header.mtime, kind: header.kind,
+                             link: c.long_link, uname: header.uname, gname: header.gname,
+                             devmajor: header.devmajor, devminor: header.devminor }
+    let records = list.concat(c.globals, c.pending)
+    if list.len(records) > 0
+        header = pax.apply(header, records)
+        used = PaxFormat
+    match header.kind
+        TarFile =>
+            if str.ends_with(header.path, "/")
+                header = TarHeader { path: header.path, mode: header.mode, uid: header.uid,
+                                     gid: header.gid, size: header.size, mtime: header.mtime,
+                                     kind: TarDirectory, link: header.link, uname: header.uname,
+                                     gname: header.gname, devmajor: header.devmajor,
+                                     devminor: header.devminor }
+        _       => 0
+    c.long_name = ""
+    c.long_link = ""
+    c.pending = []
+    c.format = used
+    c.entries = c.entries + 1
+    let entry = TarEntry { header: header, block: index, records: pax.unapplied(records), format: used }
+    list.push(c.events, TarHeaderSeen(entry))
+    match header.kind
+        TarUnknown(b) =>
+            fail(var c, UnsupportedEntryKind(index, b))
+            return
+        _             => 0
+    if tarheader.has_data(header.kind) and header.size > 0
+        c.state = STATE_DATA
+        c.owed = header.size
+        c.pad = tar.padding_for(header.size)
+    else
+        c.owed = 0
+        c.pad = 0
+        list.push(c.events, TarEntryDone)
+
+fn collect_entries(var entries: [TarEntry], events: [TarEvent])
+    for ev in events
+        match ev
+            TarHeaderSeen(e) => list.push(entries, e)
+            _                => 0
