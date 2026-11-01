@@ -1,0 +1,119 @@
+// tarwrite_misuse_tests.nv — the writer's refusals, and the reader over
+// a source that fails.
+
+use std.test
+use tar
+use tarerror
+use tarheader
+use tarread
+use tarwrite
+
+// A source that always fails.
+struct Dead
+    reads: Int
+
+impl Read[] for Dead
+    fn read(self, n: Int) -> Result<Bytes, IoError>
+        Err(IoNotFound)
+
+fn opened(w: TarWriter, h: TarHeader) -> TarWriter
+    match tarwrite.write_header(w, h)
+        Ok((w2, _)) => w2
+        Err(e)      =>
+            test.fail(e.message())
+            w
+
+@test
+fn test_a_second_header_before_end_entry_is_refused() [io]
+    let w = opened(tarwrite.writer(PaxFormat), tarheader.header("a", 1))
+    match tarwrite.write_header(w, tarheader.header("b", 1))
+        Err(FieldTooLarge(f, _)) => test.assert(str.contains(f, "open"))
+        _                        => test.fail("two open entries")
+
+@test
+fn test_nothing_is_written_after_finish() [io]
+    match tarwrite.finish(tarwrite.writer(PaxFormat))
+        Ok((w, _)) =>
+            match tarwrite.write_header(w, tarheader.header("a", 1))
+                Err(FieldTooLarge(f, _)) => test.assert(str.contains(f, "end"))
+                _                        => test.fail("an entry after the end")
+            match tarwrite.finish(w)
+                Ok((w2, b)) =>
+                    test.assert(bytes.len(b) == 0)
+                    test.assert(tarwrite.total_out(w2) == 1024)
+                Err(_)      => test.fail("finishing twice was refused")
+        Err(_)     => test.fail("finish refused")
+
+@test
+fn test_data_past_the_declared_size_is_refused_at_the_end() [io]
+    test.case("the chunk that does not fit is not written, and end_entry says so")
+    let w = opened(tarwrite.writer(UstarFormat), tarheader.header("a", 4))
+    let (w2, first) = tarwrite.write_data(w, bytes.from_str("abc"))
+    test.assert(bytes.len(first) == 3)
+    let (w3, second) = tarwrite.write_data(w2, bytes.from_str("de"))
+    test.assert(bytes.len(second) == 0)
+    test.assert(tarwrite.total_out(w3) == 512 + 3)
+    match tarwrite.end_entry(w3)
+        Err(FieldTooLarge(f, v)) =>
+            test.assert(f == "size")
+            test.assert(v == 4)
+        _                        => test.fail("an overrun closed the entry")
+
+@test
+fn test_data_with_no_entry_open_is_dropped() [io]
+    let (w, out) = tarwrite.write_data(tarwrite.writer(PaxFormat), bytes.from_str("stray"))
+    test.assert(bytes.len(out) == 0)
+    test.assert(tarwrite.total_out(w) == 0)
+
+@test
+fn test_an_entry_closes_with_its_padding() [io]
+    let w = opened(tarwrite.writer(UstarFormat), tarheader.header("a", 5))
+    let (w2, _) = tarwrite.write_data(w, bytes.from_str("hello"))
+    match tarwrite.end_entry(w2)
+        Ok((w3, pad)) =>
+            test.assert(bytes.len(pad) == 507)
+            test.assert(tarwrite.in_entry(w3) == false)
+            test.assert(tarwrite.total_out(w3) == 1024)
+        Err(_)        => test.fail("a complete entry was refused")
+
+@test
+fn test_a_size_on_a_kind_with_no_payload_is_refused() [io]
+    test.case("a directory that claims data would desynchronise a reader")
+    let bad = TarHeader { path: "d/", mode: 493, uid: 0, gid: 0, size: 5, mtime: 0, kind: TarDirectory,
+                          link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    match tarwrite.write_header(tarwrite.writer(PaxFormat), bad)
+        Err(FieldTooLarge(f, _)) => test.assert(f == "size")
+        _                        => test.fail("a directory with a size was written")
+    match tarwrite.write_entry(tarwrite.writer(PaxFormat), tarheader.directory("d"), bytes.from_str("x"))
+        Err(FieldTooLarge(f, _)) => test.assert(f == "size")
+        _                        => test.fail("a directory with a payload was written")
+
+@test
+fn test_write_entry_passes_a_header_error_through() [io]
+    match tarwrite.write_entry(tarwrite.writer(UstarFormat), tarheader.header(str.repeat("a", 300), 0), bytes.zeros(0))
+        Err(PathTooLong(_, _)) => test.assert(true)
+        _                      => test.fail("USTAR wrote a 300-byte name")
+
+@test
+fn test_the_byte_count_follows_every_call() [io]
+    let w = tarwrite.writer(PaxFormat)
+    match tarwrite.write_entry(w, tarheader.header("a", 0), bytes.from_str("hi"))
+        Ok((w2, b)) =>
+            test.assert(tarwrite.total_out(w2) == bytes.len(b))
+            test.assert(tarwrite.entries_written(w2) == 1)
+        Err(_)      => test.fail("write_entry refused")
+
+@test
+fn test_a_failing_source_is_a_source_failure() [io]
+    match tarread.read_all(Dead { reads: 0 })
+        Err(TarSourceFailed(_)) => test.assert(true)
+        _                       => test.fail("the failure of the source was lost")
+
+@test
+fn test_read_all_stops_at_the_first_corrupt_header() [io]
+    let junk = Buffer.new(600)
+    let _ = junk.write(bytes.from_str(str.repeat("x", 600)))
+    let _ = junk.seek(Start(0))
+    match tarread.read_all(junk)
+        Err(BadUstarMagic(_)) => test.assert(true)
+        _                     => test.fail("junk was read as an archive")

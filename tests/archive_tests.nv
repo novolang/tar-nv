@@ -1,0 +1,438 @@
+// archive_tests.nv — whole archives: what the writer produces, what the
+// reader makes of it however the bytes arrive, and the extended-header
+// and long-name mechanisms between them.
+
+use std.test
+use tar
+use tarerror
+use tarheader
+use tarread
+use tarwrite
+use pax
+
+// What the reader found, flattened to lines a test can compare.
+fn describe(events: [TarEvent]) -> [Str]
+    var out: [Str] = []
+    for ev in events
+        match ev
+            TarHeaderSeen(e) => list.push(out, "H ${e.header.path} ${e.header.size} ${e.block}")
+            TarDataSeen(c)   => list.push(out, "D ${bytes.len(c)}")
+            TarEntryDone     => list.push(out, "E")
+            TarArchiveDone   => list.push(out, "Z")
+    out
+
+fn add(w: TarWriter, h: TarHeader, data: Bytes) -> (TarWriter, Bytes)
+    match tarwrite.write_entry(w, h, data)
+        Ok(pair) => pair
+        Err(e)   =>
+            test.fail("write_entry refused: ${e.message()}")
+            (w, bytes.zeros(0))
+
+fn close(w: TarWriter) -> Bytes
+    match tarwrite.finish(w)
+        Ok((_, b)) => b
+        Err(e)     =>
+            test.fail("finish refused: ${e.message()}")
+            bytes.zeros(0)
+
+fn sample(f: TarFormat) -> Bytes
+    let w0 = tarwrite.writer(f)
+    let (w1, a) = add(w0, tarheader.directory("src"), bytes.zeros(0))
+    let (w2, b) = add(w1, tarheader.header("src/a.txt", 0), bytes.from_str("hello"))
+    let (w3, c) = add(w2, tarheader.header("src/b.bin", 0), bytes.zeros(1500))
+    let (w4, d) = add(w3, tarheader.symlink("src/latest", "a.txt"), bytes.zeros(0))
+    let (w5, e) = add(w4, tarheader.header("empty", 0), bytes.zeros(0))
+    bytes.concat([a, b, c, d, e, close(w5)])
+
+fn source_of(data: Bytes) -> Buffer
+    let src = Buffer.new(bytes.len(data) + 1)
+    let _ = src.write(data)
+    let _ = src.seek(Start(0))
+    src
+
+fn all_events(data: Bytes, step: Int) -> [TarEvent]
+    var r = tarread.reader()
+    var out: [TarEvent] = []
+    var at = 0
+    while at < bytes.len(data)
+        var stop = at + step
+        if stop > bytes.len(data)
+            stop = bytes.len(data)
+        let (next, evs) = tarread.feed(r, bytes.slice(data, at, stop))
+        r = next
+        list.append(out, evs)
+        at = stop
+    match tarread.finish(r)
+        Ok(tail) => list.append(out, tail)
+        Err(e)   => test.fail("finish refused: ${e.message()}")
+    out
+
+// The payload of each entry, joined, in the order they came.
+fn payloads(events: [TarEvent]) -> [Bytes]
+    var out: [Bytes] = []
+    var cur: [Bytes] = []
+    for ev in events
+        match ev
+            TarDataSeen(c) => list.push(cur, bytes.clone(c))
+            TarEntryDone   =>
+                list.push(out, bytes.concat(cur))
+                cur = []
+            _              => 0
+    out
+
+@test
+fn test_an_archive_reads_back_the_same_whatever_the_chunking() [io]
+    test.case("the events differ only in how the data is split")
+    let data = sample(PaxFormat)
+    let whole = payloads(all_events(data, bytes.len(data)))
+    test.assert(list.len(whole) == 5)
+    for step in [1, 7, 511, 512, 513, 4096]
+        let got = payloads(all_events(data, step))
+        test.assert(got == whole)
+
+@test
+fn test_the_reader_reports_every_entry_with_its_block() [io]
+    test.case("directory, file, file, link and an empty file")
+    let lines = describe(all_events(sample(PaxFormat), 100000))
+    test.assert_eq(lines, ["H src/ 0 0",
+        "E",
+        "H src/a.txt 5 1",
+        "D 5",
+        "E",
+        "H src/b.bin 1500 3",
+        "D 1500",
+        "E",
+        "H src/latest 0 7",
+        "E",
+        "H empty 0 8",
+        "E",
+        "Z"])
+
+@test
+fn test_the_payloads_are_what_was_written() [io]
+    let got = payloads(all_events(sample(UstarFormat), 300))
+    test.assert(list.len(got) == 5)
+    test.assert(bytes.to_str(got[1]) == "hello")
+    test.assert(got[2] == bytes.zeros(1500))
+    test.assert(bytes.len(got[0]) == 0)
+
+@test
+fn test_the_padding_is_never_handed_out() [io]
+    test.case("a five-byte file yields five bytes, not 512")
+    let lines = describe(all_events(sample(UstarFormat), 100000))
+    test.assert(list.contains(lines, "D 5"))
+    test.assert(list.contains(lines, "D 512") == false)
+
+@test
+fn test_list_and_read_all_agree() [io]
+    let data = sample(PaxFormat)
+    match tarread.list(data)
+        Ok(es) =>
+            test.assert(list.len(es) == 5)
+            test.assert(es[1].header.path == "src/a.txt")
+            test.assert(es[1].block == 1)
+        Err(_) => test.fail("a written archive did not list")
+    match tarread.read_all(source_of(data))
+        Ok(es) => test.assert(list.len(es) == 5)
+        Err(_) => test.fail("a written archive did not read")
+
+@test
+fn test_a_long_path_travels_in_an_extended_header() [io]
+    test.case("one header call, three blocks, and the reader hides the x entry")
+    let long = str.repeat("long-directory-name/", 14) + "file.txt"
+    let w0 = tarwrite.writer(PaxFormat)
+    match tarwrite.write_header(w0, tarheader.header(long, 3))
+        Ok((_, b)) => test.assert(bytes.len(b) == 512 * 3)
+        Err(_)     => test.fail("PAX refused a long path")
+    let (w1, a) = add(w0, tarheader.header(long, 0), bytes.from_str("abc"))
+    let data = bytes.concat([a, close(w1)])
+    match tarread.list(data)
+        Ok(es) =>
+            test.assert(list.len(es) == 1)
+            test.assert(es[0].header.path == long)
+            test.assert(tar.format_name(es[0].format) == "pax")
+            test.assert(es[0].block == 2)
+        Err(e) => test.fail("an extended header did not read: ${e.message()}")
+    test.case("USTAR refuses the same path")
+    match tarwrite.write_header(tarwrite.writer(UstarFormat), tarheader.header(long, 3))
+        Err(PathTooLong(_, _)) => test.assert(true)
+        _                      => test.fail("USTAR wrote a path over its limit")
+
+@test
+fn test_every_overflowing_field_travels_in_records() [io]
+    test.case("size, ids, names, link and time")
+    let big = TarHeader { path: str.repeat("p", 120), mode: 420, uid: 5000000, gid: 6000000,
+                          size: 0, mtime: 9000000000, kind: TarSymlink, link: str.repeat("l", 130),
+                          uname: str.repeat("u", 40), gname: str.repeat("g", 40),
+                          devmajor: 0, devminor: 0 }
+    let (w1, a) = add(tarwrite.writer(PaxFormat), big, bytes.zeros(0))
+    match tarread.list(bytes.concat([a, close(w1)]))
+        Ok(es) => test.assert(es[0].header == big)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_size_over_eight_gib_is_declared_not_carried() [io]
+    test.case("the header says 9 GiB; a reader owes that many data bytes")
+    let h = tarheader.header("huge.bin", 9663676416)
+    match tarwrite.write_header(tarwrite.writer(PaxFormat), h)
+        Ok((_, b)) =>
+            let (r, evs) = tarread.feed(tarread.reader(), b)
+            test.assert(list.len(evs) == 1)
+            match tarread.finish(r)
+                Err(UnexpectedEnd(_)) => test.assert(true)
+                _                     => test.fail("the missing 9 GiB was not noticed")
+            match evs[0]
+                TarHeaderSeen(e) => test.assert(e.header.size == 9663676416)
+                _                => test.fail("no header event")
+        Err(_)     => test.fail("PAX refused a large size")
+
+@test
+fn test_vendor_records_are_kept_for_the_caller() [io]
+    test.case("what the package has no field for stays in the entry")
+    let recs = pax.emit_records([pax.record("path", "renamed.txt"), pax.record("comment", "hi"),
+                                 pax.record("mtime", "100.5"), pax.record("atime", "7")])
+    let x = TarHeader { path: "PaxHeaders.0/a", mode: 420, uid: 0, gid: 0, size: bytes.len(recs),
+                        mtime: 0, kind: TarPaxHeader, link: "", uname: "", gname: "",
+                        devmajor: 0, devminor: 0 }
+    let w0 = tarwrite.writer(UstarFormat)
+    let (w1, xb) = add(w0, x, recs)
+    let (w2, fb) = add(w1, tarheader.header("a", 0), bytes.from_str("z"))
+    match tarread.list(bytes.concat([xb, fb, close(w2)]))
+        Ok(es) =>
+            test.assert(list.len(es) == 1)
+            test.assert(es[0].header.path == "renamed.txt")
+            test.assert(es[0].header.mtime == 100)
+            test.assert(list.len(es[0].records) == 3)
+            test.assert(es[0].records[0].key == "comment")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_global_header_applies_until_replaced() [io]
+    test.case("two entries under one global record, then an override")
+    let g1 = pax.emit_records([pax.record("uname", "builder"), pax.record("comment", "all")])
+    let gh = TarHeader { path: "pax_global_header", mode: 420, uid: 0, gid: 0, size: bytes.len(g1),
+                         mtime: 0, kind: TarGlobalPaxHeader, link: "", uname: "", gname: "",
+                         devmajor: 0, devminor: 0 }
+    let g2 = pax.emit_records([pax.record("uname", "other")])
+    let w0 = tarwrite.writer(UstarFormat)
+    let (w1, a) = add(w0, gh, g1)
+    let (w2, b) = add(w1, tarheader.header("one", 0), bytes.from_str("1"))
+    let (w3, c) = add(w2, tarheader.header("two", 0), bytes.from_str("2"))
+    let (w4, d) = add(w3, TarHeader { path: "g2", mode: 420, uid: 0, gid: 0, size: bytes.len(g2),
+                                       mtime: 0, kind: TarGlobalPaxHeader, link: "", uname: "",
+                                       gname: "", devmajor: 0, devminor: 0 },
+                                       g2)
+    let (w5, e) = add(w4, tarheader.header("three", 0), bytes.from_str("3"))
+    match tarread.list(bytes.concat([a, b, c, d, e, close(w5)]))
+        Ok(es)  =>
+            test.assert(list.len(es) == 3)
+            test.assert(es[0].header.uname == "builder")
+            test.assert(es[1].header.uname == "builder")
+            test.assert(es[2].header.uname == "other")
+            test.assert(list.len(es[0].records) == 1)
+        Err(e2) => test.fail(e2.message())
+
+@test
+fn test_gnu_long_names_are_resolved() [io]
+    test.case("an L entry names the next entry, a K entry its link")
+    let name = str.repeat("n", 130)
+    let target = str.repeat("t", 140)
+    let lh = TarHeader { path: "././@LongLink", mode: 0, uid: 0, gid: 0, size: 131, mtime: 0,
+                         kind: TarLongName, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    let kh = TarHeader { path: "././@LongLink", mode: 0, uid: 0, gid: 0, size: 141, mtime: 0,
+                         kind: TarLongLink, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    let w0 = tarwrite.writer(UstarFormat)
+    let (w1, a) = add(w0, lh, bytes.from_str(name + "\0"))
+    let (w2, b) = add(w1, kh, bytes.from_str(target + "\0"))
+    let (w3, c) = add(w2, tarheader.symlink("short", "short"), bytes.zeros(0))
+    match tarread.list(bytes.concat([a, b, c, close(w3)]))
+        Ok(es) =>
+            test.assert(list.len(es) == 1)
+            test.assert(es[0].header.path == name)
+            test.assert(es[0].header.link == target)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_empty_extension_payloads_reset_what_they_set() [io]
+    test.case("an empty L, K, x or g entry leaves nothing pending")
+    let w0 = tarwrite.writer(UstarFormat)
+    var parts: [Bytes] = []
+    var w = w0
+    for k in [TarLongName, TarLongLink, TarPaxHeader, TarGlobalPaxHeader]
+        let h = TarHeader { path: "ext", mode: 0, uid: 0, gid: 0, size: 0, mtime: 0, kind: k,
+                            link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+        let (w2, b) = add(w, h, bytes.zeros(0))
+        w = w2
+        list.push(parts, bytes.clone(b))
+    let (w3, f) = add(w, tarheader.header("plain", 0), bytes.from_str("p"))
+    list.push(parts, bytes.clone(f))
+    list.push(parts, close(w3))
+    match tarread.list(bytes.concat(parts))
+        Ok(es) =>
+            test.assert(list.len(es) == 1)
+            test.assert(es[0].header.path == "plain")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_lone_zero_block_is_skipped() [io]
+    test.case("GNU tar warns and carries on")
+    let w0 = tarwrite.writer(UstarFormat)
+    let (w1, a) = add(w0, tarheader.header("a", 0), bytes.from_str("1"))
+    let (w2, b) = add(w1, tarheader.header("b", 0), bytes.from_str("2"))
+    let data = bytes.concat([a, bytes.zeros(512), b, close(w2)])
+    match tarread.list(data)
+        Ok(es) => test.assert(list.len(es) == 2)
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_bytes_after_the_end_are_not_read() [io]
+    test.case("tape padding and concatenated archives are normal")
+    let data = bytes.concat([sample(PaxFormat), bytes.from_str("trailing text, not a header")])
+    let (r, evs) = tarread.feed(tarread.reader(), data)
+    test.assert(tarread.is_done(r))
+    test.assert(list.len(evs) > 0)
+    test.assert(tarread.entries_seen(r) == 5)
+    match tarread.finish(r)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("bytes after the end made it a failure")
+    test.assert(tarread.total_in(r) < bytes.len(data))
+    let (r2, more) = tarread.feed(r, bytes.from_str("more"))
+    test.assert(list.len(more) == 0)
+    test.assert(tarread.is_done(r2))
+
+@test
+fn test_a_truncated_archive_says_where() [io]
+    let data = sample(UstarFormat)
+    test.case("cut inside a header block")
+    let cut1 = bytes.slice(data, 0, 512 * 3 + 100)
+    match tarread.list(cut1)
+        Err(ShortBlock(off, got)) =>
+            test.assert(off == 1536)
+            test.assert(got == 100)
+        _                         => test.fail("a half block was not named")
+    test.case("cut between blocks, before the end marker")
+    match tarread.list(bytes.slice(data, 0, 512 * 2))
+        Err(UnexpectedEnd(off)) => test.assert(off == 1024)
+        _                       => test.fail("a missing end was not named")
+    test.case("cut inside a payload")
+    match tarread.list(bytes.slice(data, 0, 512 * 2 + 3))
+        Err(UnexpectedEnd(off)) => test.assert(off == 1027)
+        _                       => test.fail("a cut payload was not named")
+
+@test
+fn test_a_corrupt_header_fails_the_reader_but_keeps_the_events() [io]
+    test.case("the entries before it are returned, and the failure is sticky")
+    var data = bytes.clone(sample(UstarFormat))
+    bytes.set_u8(data, 512 * 3 + 5, 'Z')
+    let (r, evs) = tarread.feed(tarread.reader(), data)
+    test.assert(list.len(evs) > 0)
+    match tarread.error(r)
+        Some(BadHeaderChecksum(b, _, _)) => test.assert(b == 3)
+        _                                => test.fail("a corrupt header was not reported")
+    let (r2, more) = tarread.feed(r, bytes.from_str("anything"))
+    test.assert(list.len(more) == 0)
+    match tarread.finish(r2)
+        Err(BadHeaderChecksum(_, _, _)) => test.assert(true)
+        _                               => test.fail("finish forgot the failure")
+
+@test
+fn test_a_sparse_entry_is_reported_not_guessed_at() [io]
+    test.case("the header is handed out, then the reader stops")
+    let h = TarHeader { path: "sparse", mode: 420, uid: 0, gid: 0, size: 10, mtime: 0,
+                        kind: TarUnknown(83), link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    match tarheader.emit(h, UstarFormat)
+        Ok(b)  =>
+            let (r, evs) = tarread.feed(tarread.reader(), b)
+            test.assert(list.len(evs) == 1)
+            match tarread.error(r)
+                Some(UnsupportedEntryKind(blk, kind)) =>
+                    test.assert(blk == 0)
+                    test.assert(kind == 83)
+                _                                     => test.fail("an unknown kind was not reported")
+        Err(_) => test.fail("could not build the header")
+
+@test
+fn test_an_extended_header_over_the_limit_is_refused() [io]
+    test.case("it is held in memory, so a hostile size must not allocate")
+    let h = TarHeader { path: "x", mode: 0, uid: 0, gid: 0, size: 5000000, mtime: 0,
+                        kind: TarPaxHeader, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    match tarheader.emit(h, UstarFormat)
+        Ok(b)  =>
+            let (r, _) = tarread.feed(tarread.reader(), b)
+            match tarread.error(r)
+                Some(BadPaxRecord(_, _)) => test.assert(true)
+                _                        => test.fail("a 5 MB extended header was accepted")
+        Err(_) => test.fail("could not build the header")
+
+@test
+fn test_a_malformed_extended_header_is_refused() [io]
+    let junk = bytes.from_str("zz not a record\n")
+    let h = TarHeader { path: "x", mode: 0, uid: 0, gid: 0, size: bytes.len(junk), mtime: 0,
+                        kind: TarPaxHeader, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    let (w1, a) = add(tarwrite.writer(UstarFormat), h, junk)
+    match tarread.list(bytes.concat([a, close(w1)]))
+        Err(BadPaxRecord(b, _)) => test.assert(b == 0)
+        _                       => test.fail("a bad record was accepted")
+    let (w3, g) = add(tarwrite.writer(UstarFormat), TarHeader { path: "g", mode: 0, uid: 0, gid: 0,
+                       size: bytes.len(junk), mtime: 0, kind: TarGlobalPaxHeader, link: "", uname: "",
+                       gname: "", devmajor: 0, devminor: 0 },
+                       junk)
+    match tarread.list(bytes.concat([g, close(w3)]))
+        Err(BadPaxRecord(_, _)) => test.assert(true)
+        _                       => test.fail("a bad global record was accepted")
+
+@test
+fn test_a_hard_link_with_a_size_has_no_payload() [io]
+    test.case("old writers put the file's size on the link; the data is not repeated")
+    let h = TarHeader { path: "b", mode: 420, uid: 0, gid: 0, size: 700, mtime: 0, kind: TarHardLink,
+                        link: "a", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    match tarheader.emit(h, UstarFormat)
+        Ok(b)  =>
+            match tarread.list(bytes.concat([b, tar.end_of_archive()]))
+                Ok(es) => test.assert(es[0].header.size == 700)
+                Err(e) => test.fail(e.message())
+        Err(_) => test.fail("could not build the header")
+
+@test
+fn test_a_text_file_is_not_an_archive() [io]
+    let text = str.repeat("this is not a tar archive\n", 40)
+    match tarread.list(bytes.from_str(text))
+        Err(BadUstarMagic(b)) => test.assert(b == 0)
+        _                     => test.fail("text was read as an archive")
+
+@test
+fn test_every_prefix_of_an_archive_is_read_or_refused() [io]
+    test.case("no cut point panics, and only the whole archive is complete")
+    let data = sample(PaxFormat)
+    var complete = 0
+    var at = 0
+    while at <= bytes.len(data)
+        match tarread.list(bytes.slice(data, 0, at))
+            Ok(_)  =>
+                complete = complete + 1
+            Err(_) => 0
+        at = at + 61
+    test.assert(complete <= 1)
+
+@test
+fn test_a_directory_with_a_nul_typeflag_is_found_by_its_slash() [io]
+    test.case("the pre-POSIX spelling of a directory, decided after the long names")
+    let h = TarHeader { path: "old/", mode: 493, uid: 0, gid: 0, size: 0, mtime: 0, kind: TarUnknown(0),
+                        link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    match tarheader.emit(h, UstarFormat)
+        Ok(b)  =>
+            match tarread.list(bytes.concat([b, tar.end_of_archive()]))
+                Ok(es) => test.assert(tarheader.kind_byte(es[0].header.kind) == 53)
+                Err(e) => test.fail(e.message())
+        Err(_) => test.fail("could not build the header")
+
+@test
+fn test_an_extended_header_split_across_chunks_reads_the_same() [io]
+    test.case("the records are gathered over several feeds")
+    let long = str.repeat("long-directory-name/", 14) + "file.txt"
+    let (w1, a) = add(tarwrite.writer(PaxFormat), tarheader.header(long, 0), bytes.from_str("abc"))
+    let data = bytes.concat([a, close(w1)])
+    for step in [1, 100, 511]
+        let lines = describe(all_events(data, step))
+        test.assert(lines[0] == "H ${long} 3 0" or lines[0] == "H ${long} 3 2")
+        test.assert(list.contains(lines, "Z"))

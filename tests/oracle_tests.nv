@@ -1,0 +1,269 @@
+// oracle_tests.nv — GNU tar as the oracle.
+//
+// Every test here runs the system `tar` and compares: an archive this
+// package writes is listed and extracted by GNU tar, and an archive GNU
+// tar writes in each of its formats is read by this package.  A machine
+// without GNU tar skips the suite, which then passes without comparing
+// anything.
+
+use std.test
+use tar
+use tarheader
+use tarread
+use tarwrite
+
+fn sh(cmd: Str) -> Str
+    let (out, _) = process.run(cmd)
+    out
+
+fn has_gnu_tar() -> Bool [io]
+    str.contains(sh("tar --version 2>&1"), "GNU tar")
+
+fn scratch() -> Str [io, fs]
+    fs.temp_dir()
+
+fn save(path: Str, data: Bytes) [io, fs]
+    match File.open_write(path)
+        Some(f) =>
+            let _ = f.write_all(data)
+            let _ = f.close()
+        None    => test.fail("cannot write ${path}")
+
+fn slurp(path: Str) -> Bytes [io, fs]
+    fs.read_bytes(path) ?? bytes.zeros(0)
+
+fn add(w: TarWriter, h: TarHeader, data: Bytes) -> (TarWriter, Bytes)
+    match tarwrite.write_entry(w, h, data)
+        Ok(pair) => pair
+        Err(e)   =>
+            test.fail("write_entry refused: ${e.message()}")
+            (w, bytes.zeros(0))
+
+fn close(w: TarWriter) -> Bytes
+    match tarwrite.finish(w)
+        Ok((_, b)) => b
+        Err(e)     =>
+            test.fail("finish refused: ${e.message()}")
+            bytes.zeros(0)
+
+// A payload whose every byte depends on its position, so that a shifted
+// or repeated byte cannot go unseen.
+fn pattern(n: Int) -> Bytes
+    var b = bytes.zeros(n)
+    for i in 0..n
+        bytes.set_u8(b, i, (i * 7 + i / 256) & 255)
+    b
+
+fn deep_path(f: TarFormat) -> Str
+    match f
+        PaxFormat => str.repeat("deep-directory/", 20) + "leaf.bin"
+        _         => str.repeat("deep-directory/", 10) + "leaf.bin"
+
+fn written(f: TarFormat) -> Bytes
+    let deep = deep_path(f)
+    let w0 = tarwrite.writer(f)
+    let (w1, a) = add(w0, tarheader.with_mtime(tarheader.directory("proj"), 1757376000), bytes.zeros(0))
+    let (w2, b) = add(w1,
+        tarheader.with_mtime(tarheader.with_mode(tarheader.header("proj/run.sh", 0), 493), 1757376001),
+        bytes.from_str("#!/bin/sh\necho hi\n"))
+    let (w3, c) = add(w2, tarheader.with_mtime(tarheader.header("proj/data.bin", 0), 1757376002), pattern(5000))
+    let (w4, d) = add(w3,
+        tarheader.with_mtime(tarheader.symlink("proj/latest", "data.bin"), 1757376003),
+        bytes.zeros(0))
+    let (w5, e) = add(w4, tarheader.with_mtime(tarheader.header("proj/empty", 0), 1757376004), bytes.zeros(0))
+    let (w6, g) = add(w5, tarheader.with_mtime(tarheader.header(deep, 0), 1757376005), bytes.from_str("deep"))
+    bytes.concat([a, b, c, d, e, g, close(w6)])
+
+@test
+fn test_gnu_tar_lists_what_the_writer_wrote() [io, fs]
+    if not has_gnu_tar()
+        return
+    for f in [UstarFormat, PaxFormat]
+        let dir = scratch()
+        save("${dir}/out.tar", written(f))
+        let listing = sh("cd ${dir} && TZ=UTC tar --numeric-owner -tvf out.tar 2>&1 | tr -s ' '")
+        test.assert(str.contains(listing, "drwxr-xr-x 0/0 0 2025-09-09 00:00 proj/\n"))
+        test.assert(str.contains(listing, "-rwxr-xr-x 0/0 18 2025-09-09 00:00 proj/run.sh\n"))
+        test.assert(str.contains(listing, "-rw-r--r-- 0/0 5000 2025-09-09 00:00 proj/data.bin\n"))
+        test.assert(str.contains(listing, "lrwxrwxrwx 0/0 0 2025-09-09 00:00 proj/latest -> data.bin\n"))
+        test.assert(str.contains(listing, "-rw-r--r-- 0/0 0 2025-09-09 00:00 proj/empty\n"))
+        test.assert(str.contains(listing, deep_path(f) + "\n"))
+        test.assert(str.contains(listing, "tar:") == false)
+
+@test
+fn test_gnu_tar_extracts_the_bytes_that_were_written() [io, fs]
+    if not has_gnu_tar()
+        return
+    for f in [UstarFormat, PaxFormat]
+        let dir = scratch()
+        save("${dir}/out.tar", written(f))
+        let (_, status) = process.run("cd ${dir} && tar -xf out.tar")
+        test.assert(status == 0)
+        test.assert(slurp("${dir}/proj/data.bin") == pattern(5000))
+        test.assert(bytes.to_str(slurp("${dir}/proj/run.sh")) == "#!/bin/sh\necho hi\n")
+        test.assert(sh("readlink ${dir}/proj/latest") == "data.bin\n")
+        test.assert(sh("stat -c %a ${dir}/proj/run.sh") == "755\n")
+        test.assert(sh("stat -c %Y ${dir}/proj/data.bin") == "1757376002\n")
+        test.assert(bytes.to_str(slurp("${dir}/${deep_path(f)}")) == "deep")
+
+@test
+fn test_the_header_is_byte_for_byte_what_gnu_tar_writes() [io, fs]
+    if not has_gnu_tar()
+        return
+    let dir = scratch()
+    save("${dir}/hello.txt", bytes.from_str("hello\n"))
+    let (_, status) = process.run("cd ${dir} && touch -d @1757376000 hello.txt && tar --format=ustar --owner=klaus:1000 --group=staff:1000 --mode=0644 --mtime=@1757376000 -cf g.tar hello.txt")
+    test.assert(status == 0)
+    let theirs = bytes.slice(slurp("${dir}/g.tar"), 0, 512)
+    let h = tarheader.with_owner_names(tarheader.with_owner(tarheader.with_mtime(tarheader.header("hello.txt", 6), 1757376000), 1000, 1000),
+        "klaus",
+        "staff")
+    match tarheader.emit(h, UstarFormat)
+        Ok(ours) =>
+            test.assert(ours == theirs)
+            test.assert(tarheader.checksum(ours) == tarheader.checksum(theirs))
+        Err(_)   => test.fail("emit refused")
+
+@test
+fn test_the_archive_is_byte_for_byte_what_gnu_tar_writes() [io, fs]
+    if not has_gnu_tar()
+        return
+    let dir = scratch()
+    save("${dir}/a.txt", bytes.from_str("alpha\n"))
+    save("${dir}/b.bin", pattern(1300))
+    let (_, status) = process.run("cd ${dir} && touch -d @1757376000 a.txt b.bin && tar --format=ustar --blocking-factor=1 --owner=0 --group=0 --numeric-owner --mode=0644 --mtime=@1757376000 -cf g.tar a.txt b.bin")
+    test.assert(status == 0)
+    let w0 = tarwrite.writer(UstarFormat)
+    let (w1, a) = add(w0, tarheader.with_mtime(tarheader.header("a.txt", 0), 1757376000), bytes.from_str("alpha\n"))
+    let (w2, b) = add(w1, tarheader.with_mtime(tarheader.header("b.bin", 0), 1757376000), pattern(1300))
+    test.assert(bytes.concat([a, b, close(w2)]) == slurp("${dir}/g.tar"))
+
+fn names(es: [TarEntry]) -> [Str]
+    var out: [Str] = []
+    for e in es
+        list.push(out, e.header.path)
+    out
+
+// A tree GNU tar archives in the format `fmt`, read back by this package.
+fn gnu_archive(fmt: Str) -> Bytes [io, fs]
+    let dir = scratch()
+    let long = str.repeat("a-rather-long-directory-name/", 9)
+    let setup = "cd ${dir} && mkdir -p tree/sub ${long} && printf 'one\\n' > tree/one.txt && head -c 3000 /dev/urandom > tree/sub/rand.bin && ln -s one.txt tree/link && chmod 644 tree/one.txt && printf 'x' > ${long}file.txt && touch -d @1757376000 tree tree/sub tree/one.txt tree/sub/rand.bin ${long}file.txt"
+    let (_, s1) = process.run(setup)
+    test.assert(s1 == 0)
+    let (_, s2) = process.run("cd ${dir} && tar --format=${fmt} --sort=name --numeric-owner --owner=1000 --group=100 -cf g.tar tree ${long}file.txt")
+    test.assert(s2 == 0)
+    slurp("${dir}/g.tar")
+
+fn check_gnu_archive(fmt: Str)
+    let data = gnu_archive(fmt)
+    let long = str.repeat("a-rather-long-directory-name/", 9)
+    match tarread.list(data)
+        Ok(es) =>
+            let got = names(es)
+            test.assert(list.contains(got, "tree/"))
+            test.assert(list.contains(got, "tree/one.txt"))
+            test.assert(list.contains(got, "tree/sub/rand.bin"))
+            test.assert(list.contains(got, "tree/link"))
+            test.assert(list.contains(got, long + "file.txt"))
+            for e in es
+                if e.header.path == "tree/one.txt"
+                    test.assert(e.header.size == 4)
+                    test.assert(e.header.mtime == 1757376000)
+                    test.assert(e.header.uid == 1000)
+                    test.assert(e.header.gid == 100)
+                    test.assert(e.header.mode == 420)
+                if e.header.path == "tree/link"
+                    test.assert(e.header.link == "one.txt")
+                    test.assert(tarheader.kind_byte(e.header.kind) == 50)
+                if e.header.path == "tree/"
+                    test.assert(tarheader.kind_byte(e.header.kind) == 53)
+        Err(e) => test.fail("${fmt}: ${e.message()}")
+
+@test
+fn test_this_package_reads_ustar_from_gnu_tar() [io, fs]
+    if not has_gnu_tar()
+        return
+    let dir = scratch()
+    let long = str.repeat("d/", 40)
+    let (_, s) = process.run("cd ${dir} && mkdir -p ${long} && printf 'x' > ${long}f.txt && printf 'y' > g.txt && tar --format=ustar -cf g.tar ${long}f.txt g.txt")
+    test.assert(s == 0)
+    match tarread.list(slurp("${dir}/g.tar"))
+        Ok(es) =>
+            test.assert_eq(names(es), [long + "f.txt", "g.txt"])
+            test.assert(tar.format_name(es[1].format) == "ustar")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_this_package_reads_pax_from_gnu_tar() [io, fs]
+    if not has_gnu_tar()
+        return
+    check_gnu_archive("pax")
+
+@test
+fn test_this_package_reads_gnu_format_from_gnu_tar() [io, fs]
+    if not has_gnu_tar()
+        return
+    check_gnu_archive("gnu")
+
+@test
+fn test_this_package_reads_oldgnu_format_from_gnu_tar() [io, fs]
+    if not has_gnu_tar()
+        return
+    check_gnu_archive("oldgnu")
+
+@test
+fn test_this_package_reads_v7_from_gnu_tar() [io, fs]
+    if not has_gnu_tar()
+        return
+    let dir = scratch()
+    let (_, s) = process.run("cd ${dir} && printf 'seven' > v7.txt && touch -d @1757376000 v7.txt && tar --format=v7 --numeric-owner --owner=5 --group=6 -cf g.tar v7.txt")
+    test.assert(s == 0)
+    match tarread.list(slurp("${dir}/g.tar"))
+        Ok(es) =>
+            test.assert(list.len(es) == 1)
+            test.assert(es[0].header.path == "v7.txt")
+            test.assert(es[0].header.size == 5)
+            test.assert(es[0].header.uid == 5)
+            test.assert(tar.format_name(es[0].format) == "v7")
+        Err(e) => test.fail(e.message())
+
+@test
+fn test_a_huge_sparse_file_has_its_size_read_from_the_extended_header() [io, fs]
+    if not has_gnu_tar()
+        return
+    let dir = scratch()
+    let (_, s) = process.run("cd ${dir} && truncate -s 9G big.bin && tar --format=pax -cf - big.bin | head -c 2048 > g.tar")
+    test.assert(s == 0)
+    let (r, evs) = tarread.feed(tarread.reader(), slurp("${dir}/g.tar"))
+    test.assert(list.len(evs) >= 1)
+    match evs[0]
+        TarHeaderSeen(e) =>
+            test.assert(e.header.path == "big.bin")
+            test.assert(e.header.size == 9663676416)
+        _                => test.fail("no header")
+    test.assert(tarread.error(r) == None)
+
+@test
+fn test_the_payload_of_every_gnu_entry_is_intact() [io, fs]
+    if not has_gnu_tar()
+        return
+    let dir = scratch()
+    let (_, s) = process.run("cd ${dir} && head -c 70000 /dev/urandom > r.bin && tar --format=pax -cf g.tar r.bin && cp r.bin want.bin")
+    test.assert(s == 0)
+    let data = slurp("${dir}/g.tar")
+    var r = tarread.reader()
+    var got: [Bytes] = []
+    var at = 0
+    while at < bytes.len(data)
+        var stop = at + 1000
+        if stop > bytes.len(data)
+            stop = bytes.len(data)
+        let (next, evs) = tarread.feed(r, bytes.slice(data, at, stop))
+        r = next
+        for ev in evs
+            match ev
+                TarDataSeen(c) => list.push(got, bytes.clone(c))
+                _              => 0
+        at = stop
+    test.assert(bytes.concat(got) == slurp("${dir}/want.bin"))
