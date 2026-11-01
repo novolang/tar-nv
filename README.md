@@ -7,11 +7,6 @@ in two versions — USTAR (POSIX.1-1988) and PAX (POSIX.1-2001). This package
 reads and writes both in novo-lang, with V7 archives readable, and touches no
 filesystem at all.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared with
-its full signature, but every body is a `todo()` that panics when called. The
-package is published so its design can be reviewed and depended on before it is
-implemented. Version 0.1.0 will be the first working release.
-
 ## What tar is
 
 tar has no compression, no index, no checksum over the archive, and no framing
@@ -70,29 +65,25 @@ novo pkg build
 novo test
 ```
 
-Today `novo test` fails on purpose: every assertion reaches
-`not implemented: tar-nv.<fn>`. `novo test --isolate` is the readable form, with
-one verdict per test naming the function it stopped at.
-
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
 | `tar` | The format's arithmetic: the block size, how many blocks a payload takes, the padding, the zero-block test, and the end-of-archive blocks. |
 | `tarheader` | A header as a value with every field typed, its constructors and setters, the parser, the emitter, the checksum rule, and the USTAR path test. |
-| `pax` | PAX extended records: parsing, emitting, lookup, and applying a record set to a header. |
+| `pax` | PAX extended records: parsing, emitting, lookup, applying a record set to a header, and the records a header cannot hold. |
 | `tarread` | The reader: `feed` and `finish`, the events they emit, `read_all` over a stream you supply, and `list`. |
 | `tarwrite` | The writer: `write_header`, `write_data`, `end_entry`, the one-call `write_entry`, and `finish`. |
 | `tarerror` | `TarError`, its message, the block and byte it happened at, and `is_recoverable`. |
 
-Nine public types and 50 public functions. No function in this package opens a
+Nine public types and 51 public functions. No function in this package opens a
 file, reads a clock or performs any input or output. Paths, modes, owners and
 times are values a caller supplies.
 
 The one function that meets a stream charges its caller rather than declaring an
 effect of its own:
 
-```novo
+```novo ignore
 pub fn read_all<S: Read[e]>(src: S) -> Result<[TarEntry], TarError> [e]
 ```
 
@@ -102,7 +93,7 @@ A file charges `[io]`; an in-memory buffer charges nothing.
 
 **Reading an archive: `tarread.reader`, `feed` and `finish`.**
 
-```novo
+```novo ignore
 pub fn reader() -> TarReader
 pub fn feed(r: TarReader, chunk: Bytes) -> (TarReader, [TarEvent])
 pub fn finish(r: TarReader) -> Result<[TarEvent], TarError>
@@ -165,7 +156,9 @@ composition the caller makes, which is what lets a program that only needs
 7. **A directory, a link, a device and a FIFO have no data blocks.**
    `tarheader.has_data` answers the question.
 8. **`tarheader.fits_ustar` says whether a path needs PAX**, before anything is
-   written. A path that does not fit and a format of USTAR is
+   written. A path fits when it is at most 100 bytes, or when a slash splits it
+   into a prefix of at most 155 bytes and a name of at most 100, so 256 bytes
+   at most. A path that does not fit and a format of USTAR is
    `PathTooLong(path, cap)`.
 
 The errors are `BadHeaderChecksum(block, want, got)`, `BadUstarMagic(block)`,
@@ -175,6 +168,18 @@ The errors are `BadHeaderChecksum(block, want, got)`, `BadUstarMagic(block)`,
 `TarSourceFailed(cause)`. Each carries the block and the byte it happened at,
 through `tarerror.block_of` and `tarerror.byte_of`, and
 `tarerror.is_recoverable` says whether a reader can carry on past it.
+
+9. **A reader stops at its first failure.** The events produced before it are
+   returned, `tarread.error` answers the failure from then on, and every later
+   `feed` answers nothing. Starting again at the next plausible header is a
+   policy, and it belongs to the caller; `tarerror.is_recoverable` says whether
+   it is worth trying.
+10. **The extended header, the global header and a long name are held in
+    memory**, so one that claims more than 1 MiB is refused with
+    `BadPaxRecord`. File data is never held.
+11. **A writer that is handed too much data refuses the chunk that overruns.**
+    `write_data` has no error to return, so it writes nothing for that chunk
+    and `end_entry` answers `FieldTooLarge("size", declared)`.
 
 ## What is specification and what is convention
 
@@ -197,7 +202,12 @@ correctness:**
 - The trailing `/` on a directory's path. Not required, written by everyone, and
   relied on by readers that meet a pre-POSIX type byte.
 - Base-256 numeric fields for sizes over 8 GiB. GNU's extension, now universal,
-  and what PAX exists to replace.
+  and what PAX exists to replace. The reader accepts them. The writer uses them
+  under PAX, beside the extended record that carries the real number, and
+  refuses to under USTAR.
+- A header's device numbers are written for a device and left empty for every
+  other kind, which is what GNU tar writes.
+- A lone zero block between entries is skipped, as GNU tar skips it.
 - The signed-checksum fallback, which some 1980s writers produced from a
   compiler whose `char` was signed. Accepted on read, never written.
 
@@ -226,21 +236,11 @@ This package has no dependencies.
 
 ## The reference implementation
 
-GNU tar and Python's `tarfile` for behaviour, with POSIX.1-2017 as the
-specification and `bsdtar`'s corpus as the oracle for the archives that are
-legal but strange.
-
-## Implementation status
-
-| Module | Public types | Functions | Implemented |
-| --- | --- | --- | --- |
-| `tar` | 1 | 6 | no |
-| `tarheader` | 2 | 14 | no |
-| `pax` | 1 | 7 | no |
-| `tarread` | 3 | 10 | no |
-| `tarwrite` | 1 | 10 | no |
-| `tarerror` | 1 | 3 | no |
-| **Total** | **9** | **50** | **no** |
+GNU tar 1.35 is the oracle. The test suite runs it: archives this package
+writes are listed and extracted by `tar`, archives `tar` writes in the `ustar`,
+`pax`, `gnu`, `oldgnu` and `v7` formats are read by this package, and a USTAR
+archive written here is byte for byte the one `tar --format=ustar` writes. A
+machine without GNU tar skips those tests. POSIX.1-2017 is the specification.
 
 ## Licence
 

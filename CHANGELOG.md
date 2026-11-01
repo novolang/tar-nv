@@ -5,6 +5,58 @@ All notable changes to tar-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-11-01
+
+Every body is written. The signatures are the ones of 0.0.3, with the
+changes listed below.
+
+### Added
+
+- `pax.unapplied`: the records `pax.apply` does not copy into a header
+  (vendor keys, `atime`, `ctime`, and an `mtime` with a fraction), which
+  is what `TarEntry.records` holds.
+- A test suite of 11 files at 100% line coverage of `src/`. One suite
+  runs GNU tar 1.35: archives this package writes are listed and
+  extracted by it, archives it writes in the `ustar`, `pax`, `gnu`,
+  `oldgnu` and `v7` formats are read here, and a USTAR archive written
+  here is byte for byte the one `tar --format=ustar` writes.
+
+### Changed
+
+- `TarReader` gained a field, `ext`, holding the payload of an extended
+  header while it arrives. A caller that only passes the value on is not
+  affected.
+- The longest path USTAR holds is 256 bytes: 155 of prefix, a slash and
+  100 of name. The documentation said 255. `PathTooLong` carries 256 for
+  a path longer than that and 100 for one that has no slash to split at.
+- `BadHeaderChecksum(block, want, got)`: `want` is the sum computed over
+  the block and `got` is the value its checksum field stores.
+- The writer leaves the device-number fields empty for every entry that
+  is not a device, as GNU tar does, so that the header is byte for byte
+  GNU's.
+- `pax.records_size([record("path", "x")])` is 9: `9 path=x\n`. The
+  0.0.3 tests and one example said 10 and 13, which were wrong.
+- A file whose path ends in `/` is reported as a directory by the reader,
+  after the long names and extended records have been applied, and not by
+  `tarheader.parse`.
+- `tarheader.emit` under `PaxFormat` writes a number octal cannot hold
+  as base-256 and cuts a path or name it cannot split; the extended
+  header `tarwrite.write_header` puts before it carries the real value.
+- Misuse of the writer (a header while an entry is open, an entry after
+  `finish`, a size on a kind that has no data, `V7Format`) answers
+  `FieldTooLarge` naming the rule. `write_data` has no error to return:
+  a chunk that would overrun the declared size is not written, and
+  `end_entry` answers `FieldTooLarge("size", declared)`.
+- The reader stops at an entry of an unknown kind after handing out its
+  header, with `UnsupportedEntryKind`.
+- An extended header, a global header or a long name over 1 MiB is
+  refused with `BadPaxRecord`, because the reader holds it in memory.
+
+### Fixed
+
+- The manifest is `experimental`, and the README no longer says the
+  package is interface only.
+
 ## 0.0.3 — 2026-09-12
 
 ### Changed — The README is rewritten in plain technical-writer prose; no signature changed.

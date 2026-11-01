@@ -1,15 +1,12 @@
 [package]
 name        = "tar-nv"
-version     = "0.0.3"
+version     = "0.1.0"
 description = "USTAR and PAX tar archives as arithmetic over 512-byte blocks, with no filesystem anywhere: a header value with every field typed rather than a blob, a feed-and-drain reader that emits events so an archive larger than memory still streams, a writer that returns blocks, PAX extended records for the paths and sizes USTAR cannot hold, POSIX's checksum rule, and the two-zero-block end."
 license     = "Apache-2.0"
 
-# An INTERFACE release: every `pub fn` body is a `todo()`, so the
-# signatures and the effect rows are published and nothing is
-# implemented.  `novo pkg publish` recognises the shape and requires
-# both the draft stability and the 0.0.x version; the first
-# implementation is the 0.1.0 published over it.
-stability   = "draft"
+# `experimental` because no program outside this repository has used
+# the package yet.
+stability   = "experimental"
 
 # `core`, and this one is easy: tar has no compression, no index and no
 # framing beyond the number 512.  Every function here is integer
