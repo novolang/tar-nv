@@ -77,6 +77,10 @@ fn test_a_device_and_a_link_round_trip() [io]
                           kind: TarCharDevice, link: "", uname: "root", gname: "root",
                           devmajor: 1, devminor: 3 }
     test.assert(parsed(emit_ok(dev, UstarFormat)) == dev)
+    let blk = TarHeader { path: "dev/sda", mode: 432, uid: 0, gid: 6, size: 0, mtime: 5,
+                          kind: TarBlockDevice, link: "", uname: "root", gname: "disk",
+                          devmajor: 8, devminor: 16 }
+    test.assert(parsed(emit_ok(blk, UstarFormat)) == blk)
     let link = tarheader.symlink("latest", "v2.tar")
     test.assert(parsed(emit_ok(link, UstarFormat)) == link)
     let hard = TarHeader { path: "b", mode: 420, uid: 0, gid: 0, size: 0, mtime: 0,
