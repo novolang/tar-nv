@@ -40,7 +40,9 @@
 // every field it does not have.
 
 use tar
+use tarerror
 use tarheader
+use pax
 
 // A writer between entries.
 //
@@ -85,7 +87,8 @@ pub struct TarWriter
 //     println("${tar.format_name(tarwrite.writer_format(tarwrite.writer(PaxFormat)))}")
 // ```
 pub fn writer(fmt: TarFormat) -> TarWriter
-    todo("tar-nv.writer")
+    TarWriter { format: fmt, produced: 0, owed: 0, written: 0, entries: 0,
+                in_entry: false, done: false }
 
 // The layout this writer emits.
 //
@@ -97,7 +100,7 @@ pub fn writer(fmt: TarFormat) -> TarWriter
 //     println("${tar.format_name(tarwrite.writer_format(tarwrite.writer(UstarFormat)))}")
 // ```
 pub fn writer_format(w: TarWriter) -> TarFormat
-    todo("tar-nv.writer_format")
+    w.format
 
 // Begin an entry: its header block, and under PAX the extended header
 // that precedes it when one is needed.
@@ -125,7 +128,34 @@ pub fn writer_format(w: TarWriter) -> TarFormat
 //         Err(_)     => println("does not fit")
 // ```
 pub fn write_header(w: TarWriter, h: TarHeader) -> Result<(TarWriter, Bytes), TarError>
-    todo("tar-nv.write_header")
+    match w.format
+        V7Format =>
+            return Err(FieldTooLarge("format v7", 0))
+        _        => 0
+    if w.in_entry
+        return Err(FieldTooLarge("entry still open", w.entries))
+    if w.done
+        return Err(FieldTooLarge("entry after the end of the archive", w.entries))
+    var owed = 0
+    if tarheader.has_data(h.kind)
+        owed = h.size
+    else if h.size != 0
+        return Err(FieldTooLarge("size", h.size))
+    var parts: [Bytes] = []
+    match w.format
+        PaxFormat =>
+            let records = pax.records_for(h)
+            if list.len(records) > 0
+                var payload = pax.emit_records(records)
+                list.push(parts, tarheader.emit(extension_header(h, bytes.len(payload)), PaxFormat)!)
+                list.push(parts, payload)
+                list.push(parts, bytes.zeros(tar.padding_for(bytes.len(payload))))
+        _         => 0
+    list.push(parts, tarheader.emit(h, w.format)!)
+    let out = bytes.concat(parts)
+    let next = TarWriter { format: w.format, produced: w.produced + bytes.len(out), owed: owed,
+                           written: 0, entries: w.entries + 1, in_entry: true, done: false }
+    Ok((next, out))
 
 // The current entry's payload, or some of it.
 //
@@ -148,7 +178,19 @@ pub fn write_header(w: TarWriter, h: TarHeader) -> Result<(TarWriter, Bytes), Ta
 //     println("${tarwrite.total_out(w2)}")                 // 0
 // ```
 pub fn write_data(w: TarWriter, chunk: Bytes) -> (TarWriter, Bytes)
-    todo("tar-nv.write_data")
+    let n = bytes.len(chunk)
+    if not w.in_entry or n == 0
+        return (w, bytes.zeros(0))
+    let fits = w.written + n <= w.owed
+    var sent = 0
+    if fits
+        sent = n
+    let next = TarWriter { format: w.format, produced: w.produced + sent,
+                           owed: w.owed, written: w.written + n, entries: w.entries,
+                           in_entry: true, done: false }
+    if fits
+        return (next, bytes.clone(chunk))
+    (next, bytes.zeros(0))
 
 // End the current entry: the padding that takes it to a block
 // boundary.
@@ -172,7 +214,14 @@ pub fn write_data(w: TarWriter, chunk: Bytes) -> (TarWriter, Bytes)
 //         Err(_)     => println("size mismatch")
 // ```
 pub fn end_entry(w: TarWriter) -> Result<(TarWriter, Bytes), TarError>
-    todo("tar-nv.end_entry")
+    if not w.in_entry
+        return Ok((w, bytes.zeros(0)))
+    if w.written != w.owed
+        return Err(FieldTooLarge("size", w.owed))
+    let pad = bytes.zeros(tar.padding_for(w.owed))
+    let next = TarWriter { format: w.format, produced: w.produced + bytes.len(pad), owed: 0,
+                           written: 0, entries: w.entries, in_entry: false, done: false }
+    Ok((next, pad))
 
 // A whole small entry in one call: header, payload and padding.
 //
@@ -194,7 +243,11 @@ pub fn end_entry(w: TarWriter) -> Result<(TarWriter, Bytes), TarError>
 //         Err(_)     => println("does not fit")
 // ```
 pub fn write_entry(w: TarWriter, h: TarHeader, data: Bytes) -> Result<(TarWriter, Bytes), TarError>
-    todo("tar-nv.write_entry")
+    let sized = tarheader_with_size(h, bytes.len(data))
+    let (w1, head) = write_header(w, sized)!
+    let (w2, body) = write_data(w1, data)
+    let (w3, pad) = end_entry(w2)!
+    Ok((w3, bytes.concat([head, body, pad])))
 
 // End the archive: the two zero blocks.
 //
@@ -217,7 +270,14 @@ pub fn write_entry(w: TarWriter, h: TarHeader, data: Bytes) -> Result<(TarWriter
 //         Err(_)     => println("an entry is still open")
 // ```
 pub fn finish(w: TarWriter) -> Result<(TarWriter, Bytes), TarError>
-    todo("tar-nv.finish")
+    if w.in_entry
+        return Err(FieldTooLarge("entry still open", w.entries))
+    if w.done
+        return Ok((w, bytes.zeros(0)))
+    let tail = tar.end_of_archive()
+    let next = TarWriter { format: w.format, produced: w.produced + bytes.len(tail), owed: 0,
+                           written: 0, entries: w.entries, in_entry: false, done: true }
+    Ok((next, tail))
 
 // Bytes emitted so far, across every call.
 //
@@ -229,7 +289,7 @@ pub fn finish(w: TarWriter) -> Result<(TarWriter, Bytes), TarError>
 //     println("${tarwrite.total_out(tarwrite.writer(UstarFormat))}")   // 0
 // ```
 pub fn total_out(w: TarWriter) -> Int
-    todo("tar-nv.total_out")
+    w.produced
 
 // How many entries have had a header written.
 //
@@ -241,7 +301,7 @@ pub fn total_out(w: TarWriter) -> Int
 //     println("${tarwrite.entries_written(tarwrite.writer(PaxFormat))}")   // 0
 // ```
 pub fn entries_written(w: TarWriter) -> Int
-    todo("tar-nv.entries_written")
+    w.entries
 
 // Whether an entry is open — a header written and `end_entry` not yet
 // called.
@@ -257,4 +317,29 @@ pub fn entries_written(w: TarWriter) -> Int
 //     println("${tarwrite.in_entry(tarwrite.writer(PaxFormat))}")      // false
 // ```
 pub fn in_entry(w: TarWriter) -> Bool
-    todo("tar-nv.in_entry")
+    w.in_entry
+
+// The header with its size replaced.
+fn tarheader_with_size(h: TarHeader, size: Int) -> TarHeader
+    TarHeader { path: h.path, mode: h.mode, uid: h.uid, gid: h.gid, size: size, mtime: h.mtime,
+                kind: h.kind, link: h.link, uname: h.uname, gname: h.gname,
+                devmajor: h.devmajor, devminor: h.devminor }
+
+// The header of the extended-header entry that carries `h`'s records:
+// a name under `PaxHeaders.0/` cut to fit, and the owner and time of the
+// entry it describes.
+fn extension_header(h: TarHeader, size: Int) -> TarHeader
+    var base = h.path
+    var i = str.len(base) - 1
+    while i >= 0
+        if (str.byte_at(base, i) ?? 0) == '/'
+            base = str.slice(base, i + 1, str.len(base))
+            break
+        i = i - 1
+    let room = 100 - str.len(HEADERS_DIR)
+    if str.len(base) > room
+        base = str.slice(base, 0, room)
+    TarHeader { path: HEADERS_DIR + base, mode: 420, uid: 0, gid: 0, size: size, mtime: h.mtime,
+                kind: TarPaxHeader, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+
+const HEADERS_DIR = "PaxHeaders.0/"
