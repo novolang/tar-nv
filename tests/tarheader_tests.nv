@@ -167,3 +167,16 @@ fn test_local_corruption_is_recoverable_and_truncation_is_not() [io]
     test.assert(tarerror.is_recoverable(BadNumericField(4, "size", "??")))
     test.assert(tarerror.is_recoverable(UnexpectedEnd(2048)) == false)
     test.assert(tarerror.is_recoverable(BadUstarMagic(4)) == false)
+
+@test
+fn test_every_typeflag_maps_to_its_kind_and_back() [io]
+    test.case("the bytes POSIX and GNU define, and '7' read as a plain file")
+    for b in [48, 49, 50, 51, 52, 53, 54, 75, 76, 103, 120, 83, 86, 77]
+        test.assert(tarheader.kind_byte(tarheader.kind_of(b)) == b)
+    test.assert(tarheader.kind_byte(tarheader.kind_of(55)) == 48)
+    test.assert(tarheader.has_data(TarLongLink))
+    test.assert(tarheader.has_data(TarGlobalPaxHeader))
+    test.assert(tarheader.has_data(TarHardLink) == false)
+    test.assert(tarheader.has_data(TarCharDevice) == false)
+    test.assert(tarheader.has_data(TarBlockDevice) == false)
+    test.assert(tarheader.has_data(TarUnknown(83)) == false)

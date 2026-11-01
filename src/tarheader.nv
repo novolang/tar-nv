@@ -35,6 +35,9 @@
 // the file exists, and the README says what that means for a caller
 // extracting to disk — the sanitising is theirs, and it has to happen.
 
+use tar
+use tarerror
+
 // What an entry is.
 //
 // The `typeflag` byte as a value.  The prefixed names are for the
@@ -95,7 +98,19 @@ pub enum TarEntryKind
 //     println("${tarheader.kind_byte(TarFile)}")           // 48 — '0'
 // ```
 pub fn kind_byte(k: TarEntryKind) -> Int
-    todo("tar-nv.kind_byte")
+    match k
+        TarFile            => 48
+        TarHardLink        => 49
+        TarSymlink         => 50
+        TarCharDevice      => 51
+        TarBlockDevice     => 52
+        TarDirectory       => 53
+        TarFifo            => 54
+        TarLongName        => 76
+        TarLongLink        => 75
+        TarPaxHeader       => 120
+        TarGlobalPaxHeader => 103
+        TarUnknown(b)      => b
 
 // The kind a `typeflag` byte means.
 //
@@ -110,7 +125,21 @@ pub fn kind_byte(k: TarEntryKind) -> Int
 //     println("${tarheader.kind_byte(tarheader.kind_of(53))}")    // 53
 // ```
 pub fn kind_of(b: Int) -> TarEntryKind
-    todo("tar-nv.kind_of")
+    match b
+        0   => TarFile
+        48  => TarFile
+        55  => TarFile
+        49  => TarHardLink
+        50  => TarSymlink
+        51  => TarCharDevice
+        52  => TarBlockDevice
+        53  => TarDirectory
+        54  => TarFifo
+        76  => TarLongName
+        75  => TarLongLink
+        120 => TarPaxHeader
+        103 => TarGlobalPaxHeader
+        _   => TarUnknown(b)
 
 // Whether an entry of this kind is followed by data blocks.
 //
@@ -128,7 +157,13 @@ pub fn kind_of(b: Int) -> TarEntryKind
 //     println("${tarheader.has_data(TarSymlink)}")         // false
 // ```
 pub fn has_data(k: TarEntryKind) -> Bool
-    todo("tar-nv.has_data")
+    match k
+        TarFile            => true
+        TarLongName        => true
+        TarLongLink        => true
+        TarPaxHeader       => true
+        TarGlobalPaxHeader => true
+        _                  => false
 
 // One entry's header, with every field typed.
 //
@@ -199,7 +234,8 @@ pub struct TarHeader
 //     println("${tarheader.header("notes.txt", 12).mode}")    // 420
 // ```
 pub fn header(path: Str, size: Int) -> TarHeader
-    todo("tar-nv.header")
+    TarHeader { path: path, mode: 420, uid: 0, gid: 0, size: size, mtime: 0,
+                kind: TarFile, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
 
 // A header for a directory.
 //
@@ -216,7 +252,11 @@ pub fn header(path: Str, size: Int) -> TarHeader
 //     println("${tarheader.directory("src").size}")        // 0
 // ```
 pub fn directory(path: Str) -> TarHeader
-    todo("tar-nv.directory")
+    var p = path
+    if not str.ends_with(p, "/")
+        p = p + "/"
+    TarHeader { path: p, mode: 493, uid: 0, gid: 0, size: 0, mtime: 0,
+                kind: TarDirectory, link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
 
 // A header for a symbolic link.
 //
@@ -231,7 +271,8 @@ pub fn directory(path: Str) -> TarHeader
 //     println("${tarheader.symlink("latest", "v2.tar").link}")   // v2.tar
 // ```
 pub fn symlink(path: Str, target: Str) -> TarHeader
-    todo("tar-nv.symlink")
+    TarHeader { path: path, mode: 511, uid: 0, gid: 0, size: 0, mtime: 0,
+                kind: TarSymlink, link: target, uname: "", gname: "", devmajor: 0, devminor: 0 }
 
 // The header with its mode replaced.
 //
@@ -248,7 +289,18 @@ pub fn symlink(path: Str, target: Str) -> TarHeader
 //     println("${h.mode}")                                 // 493 — rwxr-xr-x
 // ```
 pub fn with_mode(h: TarHeader, mode: Int) -> TarHeader
-    todo("tar-nv.with_mode")
+    TarHeader { path: h.path,
+        mode: mode,
+        uid: h.uid,
+        gid: h.gid,
+        size: h.size,
+        mtime: h.mtime,
+        kind: h.kind,
+        link: h.link,
+        uname: h.uname,
+        gname: h.gname,
+        devmajor: h.devmajor,
+        devminor: h.devminor }
 
 // The header with its modification time replaced.
 //
@@ -262,7 +314,18 @@ pub fn with_mode(h: TarHeader, mode: Int) -> TarHeader
 //     println("${tarheader.with_mtime(tarheader.header("a", 1), 1757376000).mtime}")
 // ```
 pub fn with_mtime(h: TarHeader, mtime: Int) -> TarHeader
-    todo("tar-nv.with_mtime")
+    TarHeader { path: h.path,
+        mode: h.mode,
+        uid: h.uid,
+        gid: h.gid,
+        size: h.size,
+        mtime: mtime,
+        kind: h.kind,
+        link: h.link,
+        uname: h.uname,
+        gname: h.gname,
+        devmajor: h.devmajor,
+        devminor: h.devminor }
 
 // The header with its numeric owner replaced.
 //
@@ -273,7 +336,18 @@ pub fn with_mtime(h: TarHeader, mtime: Int) -> TarHeader
 //     println("${tarheader.with_owner(tarheader.header("a", 1), 1000, 1000).uid}")
 // ```
 pub fn with_owner(h: TarHeader, uid: Int, gid: Int) -> TarHeader
-    todo("tar-nv.with_owner")
+    TarHeader { path: h.path,
+        mode: h.mode,
+        uid: uid,
+        gid: gid,
+        size: h.size,
+        mtime: h.mtime,
+        kind: h.kind,
+        link: h.link,
+        uname: h.uname,
+        gname: h.gname,
+        devmajor: h.devmajor,
+        devminor: h.devminor }
 
 // The header with its owner NAMES replaced.
 //
@@ -288,7 +362,18 @@ pub fn with_owner(h: TarHeader, uid: Int, gid: Int) -> TarHeader
 //     println("${tarheader.with_owner_names(tarheader.header("a", 1), "klaus", "staff").uname}")
 // ```
 pub fn with_owner_names(h: TarHeader, uname: Str, gname: Str) -> TarHeader
-    todo("tar-nv.with_owner_names")
+    TarHeader { path: h.path,
+        mode: h.mode,
+        uid: h.uid,
+        gid: h.gid,
+        size: h.size,
+        mtime: h.mtime,
+        kind: h.kind,
+        link: h.link,
+        uname: uname,
+        gname: gname,
+        devmajor: h.devmajor,
+        devminor: h.devminor }
 
 // Parse a 512-byte header block.
 //
@@ -310,7 +395,45 @@ pub fn with_owner_names(h: TarHeader, uname: Str, gname: Str) -> TarHeader
 //         Err(_) => println("not 512 bytes")               // this one
 // ```
 pub fn parse(block: Bytes, index: Int) -> Result<(TarHeader, TarFormat), TarError>
-    todo("tar-nv.parse")
+    let got = bytes.len(block)
+    if got != BLOCK
+        return Err(ShortBlock(index * BLOCK, got))
+    var layout = V7Format
+    match format_of(block)
+        Some(f) =>
+            layout = f
+        None    =>
+            return Err(BadUstarMagic(index))
+    let stored = octal_field(block, index, "chksum", CHKSUM_AT, CHKSUM_LEN)!
+    let want = sum_with_spaces(block, false)
+    if stored != want and stored != sum_with_spaces(block, true)
+        return Err(BadHeaderChecksum(index, want, stored))
+    let mode = number_field(block, index, "mode", MODE_AT, MODE_LEN)!
+    let uid = number_field(block, index, "uid", UID_AT, UID_LEN)!
+    let gid = number_field(block, index, "gid", GID_AT, GID_LEN)!
+    let size = number_field(block, index, "size", SIZE_AT, SIZE_LEN)!
+    let mtime = number_field(block, index, "mtime", MTIME_AT, MTIME_LEN)!
+    var full = text_field(block, NAME_AT, NAME_LEN)
+    let kind = kind_of(bytes.byte_at(block, TYPE_AT) ?? 0)
+    var uname = ""
+    var gname = ""
+    var devmajor = 0
+    var devminor = 0
+    match layout
+        V7Format => 0
+        _        =>
+            uname = text_field(block, UNAME_AT, UNAME_LEN)
+            gname = text_field(block, GNAME_AT, GNAME_LEN)
+            devmajor = number_field(block, index, "devmajor", DEVMAJOR_AT, DEVMAJOR_LEN)!
+            devminor = number_field(block, index, "devminor", DEVMINOR_AT, DEVMINOR_LEN)!
+            if not is_gnu_magic(block)
+                let prefix = text_field(block, PREFIX_AT, PREFIX_LEN)
+                if str.len(prefix) > 0
+                    full = prefix + "/" + full
+    let h = TarHeader { path: full, mode: mode, uid: uid, gid: gid, size: size, mtime: mtime,
+                        kind: kind, link: text_field(block, LINK_AT, LINK_LEN), uname: uname,
+                        gname: gname, devmajor: devmajor, devminor: devminor }
+    Ok((h, layout))
 
 // The header as its 512-byte block, in the format asked for.
 //
@@ -320,7 +443,7 @@ pub fn parse(block: Bytes, index: Int) -> Result<(TarHeader, TarFormat), TarErro
 // prefix/name split is found here too.
 //
 // `PathTooLong` or `FieldTooLarge` when the format cannot carry what
-// the header says: a path over 255 bytes or with no split point under
+// the header says: a full over 255 bytes or with no split point under
 // `UstarFormat`, a size over 8 GiB, a uid over 2,097,151. Under
 // `PaxFormat` none of those can happen in this block — they move to
 // the extended header, and `tarwrite.write_entry` is what puts them
@@ -337,7 +460,44 @@ pub fn parse(block: Bytes, index: Int) -> Result<(TarHeader, TarFormat), TarErro
 //         Err(_) => println("does not fit")
 // ```
 pub fn emit(h: TarHeader, fmt: TarFormat) -> Result<Bytes, TarError>
-    todo("tar-nv.emit")
+    match fmt
+        V7Format =>
+            return Err(FieldTooLarge("format v7", 0))
+        _        => 0
+    let pax = is_pax(fmt)
+    var out = bytes.zeros(BLOCK)
+    let cut = split_path(h.path)
+    if cut == -2 and not pax
+        return Err(PathTooLong(h.path, path_cap(h.path)))
+    if str.len(h.link) > LINK_LEN and not pax
+        return Err(PathTooLong(h.link, LINK_LEN))
+    if str.len(h.uname) > UNAME_LEN and not pax
+        return Err(FieldTooLarge("uname", str.len(h.uname)))
+    if str.len(h.gname) > GNAME_LEN and not pax
+        return Err(FieldTooLarge("gname", str.len(h.gname)))
+    if cut >= 0
+        put_text(var out, NAME_AT, NAME_LEN, str.slice(h.path, cut + 1, str.len(h.path)))
+        put_text(var out, PREFIX_AT, PREFIX_LEN, str.slice(h.path, 0, cut))
+    else
+        put_text(var out, NAME_AT, NAME_LEN, h.path)
+    put_text(var out, LINK_AT, LINK_LEN, h.link)
+    put_number(var out, "mode", MODE_AT, MODE_LEN, h.mode, pax)!
+    put_number(var out, "uid", UID_AT, UID_LEN, h.uid, pax)!
+    put_number(var out, "gid", GID_AT, GID_LEN, h.gid, pax)!
+    put_number(var out, "size", SIZE_AT, SIZE_LEN, h.size, pax)!
+    put_number(var out, "mtime", MTIME_AT, MTIME_LEN, h.mtime, pax)!
+    if is_device(h.kind)
+        put_number(var out, "devmajor", DEVMAJOR_AT, DEVMAJOR_LEN, h.devmajor, pax)!
+        put_number(var out, "devminor", DEVMINOR_AT, DEVMINOR_LEN, h.devminor, pax)!
+    bytes.set_u8(out, TYPE_AT, kind_byte(h.kind))
+    put_text(var out, MAGIC_AT, MAGIC_LEN, "ustar")
+    put_text(var out, VERSION_AT, VERSION_LEN, "00")
+    put_text(var out, UNAME_AT, UNAME_LEN, h.uname)
+    put_text(var out, GNAME_AT, GNAME_LEN, h.gname)
+    let sum = sum_with_spaces(out, false)
+    put_octal(var out, CHKSUM_AT, 7, sum)
+    bytes.set_u8(out, CHKSUM_AT + 7, 32)
+    Ok(out)
 
 // The checksum of a 512-byte block, computed POSIX's way.
 //
@@ -359,7 +519,7 @@ pub fn emit(h: TarHeader, fmt: TarFormat) -> Result<Bytes, TarError>
 //     println("${tarheader.checksum(bytes.from_str(""))}")     // 0
 // ```
 pub fn checksum(block: Bytes) -> Int
-    todo("tar-nv.checksum")
+    sum_with_spaces(block, false)
 
 // Whether a path fits USTAR's two fields, and therefore whether
 // writing it needs PAX.
@@ -376,4 +536,214 @@ pub fn checksum(block: Bytes) -> Int
 //     println("${tarheader.fits_ustar("src/main.nv")}")     // true
 // ```
 pub fn fits_ustar(path: Str) -> Bool
-    todo("tar-nv.fits_ustar")
+    split_path(path) >= -1
+
+// The layout of a header block: where each field starts and how wide it
+// is.  A numeric field holds octal digits and ends in a NUL or a space.
+const BLOCK = 512
+const NAME_AT = 0
+const NAME_LEN = 100
+const MODE_AT = 100
+const MODE_LEN = 8
+const UID_AT = 108
+const UID_LEN = 8
+const GID_AT = 116
+const GID_LEN = 8
+const SIZE_AT = 124
+const SIZE_LEN = 12
+const MTIME_AT = 136
+const MTIME_LEN = 12
+const CHKSUM_AT = 148
+const CHKSUM_LEN = 8
+const TYPE_AT = 156
+const LINK_AT = 157
+const LINK_LEN = 100
+const MAGIC_AT = 257
+const MAGIC_LEN = 6
+const VERSION_AT = 263
+const VERSION_LEN = 2
+const UNAME_AT = 265
+const UNAME_LEN = 32
+const GNAME_AT = 297
+const GNAME_LEN = 32
+const DEVMAJOR_AT = 329
+const DEVMAJOR_LEN = 8
+const DEVMINOR_AT = 337
+const DEVMINOR_LEN = 8
+const PREFIX_AT = 345
+const PREFIX_LEN = 155
+
+// The largest value an octal field of seven digits or eleven digits
+// holds, plus one.
+const OCTAL_7 = 2097152
+const OCTAL_11 = 8589934592
+
+// The magnitude base-256 numbers are limited to, so that the arithmetic
+// stays inside a 64-bit integer: 2^55.
+const BASE256_LIMIT = 36028797018963968
+
+// Whether the entry is a device, the only kind whose device numbers are
+// written: GNU tar leaves the two fields empty for every other kind.
+fn is_device(k: TarEntryKind) -> Bool
+    match k
+        TarCharDevice  => true
+        TarBlockDevice => true
+        _              => false
+
+fn is_pax(fmt: TarFormat) -> Bool
+    match fmt
+        PaxFormat => true
+        _         => false
+
+// The sum of the 512 bytes with the checksum field counted as spaces.
+// With `signed` set every byte counts as a signed character, which is
+// what some old writers summed.
+fn sum_with_spaces(block: Bytes, signed: Bool) -> Int
+    var total = 0
+    for i in 0..bytes.len(block)
+        var b = bytes.byte_at(block, i) ?? 0
+        if i >= CHKSUM_AT and i < CHKSUM_AT + CHKSUM_LEN
+            b = 32
+        else if signed and b >= 128
+            b = b - 256
+        total = total + b
+    total
+
+// Whether the magic field says GNU's `ustar  `, whose block carries
+// other data where POSIX keeps the prefix.
+fn is_gnu_magic(block: Bytes) -> Bool
+    (bytes.byte_at(block, MAGIC_AT + 5) ?? 0) == 32
+
+// The format the magic field names, or nothing when it names none.
+fn format_of(block: Bytes) -> ?TarFormat
+    let magic = bytes.slice(block, MAGIC_AT, MAGIC_AT + 5)
+    if magic == bytes.from_str("ustar")
+        return Some(UstarFormat)
+    for i in 0..MAGIC_LEN + VERSION_LEN
+        if (bytes.byte_at(block, MAGIC_AT + i) ?? 0) != 0
+            return None
+    Some(V7Format)
+
+// The bytes of a field up to the first NUL, as text.
+fn text_field(block: Bytes, at: Int, width: Int) -> Str
+    var end = at
+    while end < at + width and (bytes.byte_at(block, end) ?? 0) != 0
+        end = end + 1
+    bytes.to_str(bytes.slice(block, at, end))
+
+// A field's bytes with the unprintable ones shown as '?', for a message.
+fn shown(block: Bytes, at: Int, width: Int) -> Str
+    var copy = bytes.slice(block, at, at + width)
+    var n = 0
+    while n < width and (bytes.byte_at(copy, n) ?? 0) != 0
+        let b = bytes.byte_at(copy, n) ?? 0
+        if b < 32 or b > 126
+            bytes.set_u8(copy, n, '?')
+        n = n + 1
+    bytes.to_str(bytes.slice(copy, 0, n))
+
+// A field of octal digits.  Leading spaces are skipped, the digits end at
+// a space or a NUL, and a field of nothing but spaces and NULs is zero.
+fn octal_field(block: Bytes, index: Int, name: Str, at: Int, width: Int) -> Result<Int, TarError>
+    var i = at
+    let end = at + width
+    while i < end and (bytes.byte_at(block, i) ?? 0) == 32
+        i = i + 1
+    var value = 0
+    while i < end
+        let b = bytes.byte_at(block, i) ?? 0
+        if b < '0' or b > '7'
+            break
+        value = value * 8 + (b - '0')
+        i = i + 1
+    while i < end
+        let b = bytes.byte_at(block, i) ?? 0
+        if b != 0 and b != 32
+            return Err(BadNumericField(index, name, shown(block, at, width)))
+        i = i + 1
+    Ok(value)
+
+// A numeric field in either encoding: octal, or GNU's base-256 when the
+// top bit of the first byte is set.
+fn number_field(block: Bytes, index: Int, name: Str, at: Int, width: Int) -> Result<Int, TarError>
+    let first = bytes.byte_at(block, at) ?? 0
+    if first < 128
+        return octal_field(block, index, name, at, width)
+    var value = first & 63
+    if (first & 64) != 0
+        value = value - 64
+    for i in 1..width
+        if value >= BASE256_LIMIT or value < -BASE256_LIMIT
+            return Err(BadNumericField(index, name, "base-256 value out of range"))
+        value = value * 256 + (bytes.byte_at(block, at + i) ?? 0)
+    Ok(value)
+
+// Where a path splits into prefix and name: the index of the slash that
+// ends the prefix, -1 when the whole path fits the name field, and -2 when
+// no split makes it fit.  Like GNU tar it takes the last slash that
+// leaves a prefix of at most 155 bytes.
+fn split_path(path: Str) -> Int
+    let n = str.len(path)
+    if n <= NAME_LEN
+        return -1
+    var i = n - 1
+    if i > PREFIX_LEN
+        i = PREFIX_LEN
+    while i > 0
+        if (str.byte_at(path, i) ?? 0) == '/' and n - i - 1 <= NAME_LEN and n - i - 1 > 0
+            return i
+        i = i - 1
+    -2
+
+// The limit a refused path ran into: the whole-path limit when the path
+// is longer than that, and the name field's otherwise.
+fn path_cap(path: Str) -> Int
+    if str.len(path) > PREFIX_LEN + 1 + NAME_LEN
+        return PREFIX_LEN + 1 + NAME_LEN
+    NAME_LEN
+
+// Writes as much of `text` as the field holds.
+fn put_text(var buf: Bytes, at: Int, width: Int, text: Str)
+    let src = bytes.from_str(text)
+    var n = bytes.len(src)
+    if n > width
+        n = width
+    bytes.copy_into(buf, at, src, 0, n)
+
+// Writes `value` as zero-padded octal digits and a NUL, `width` bytes in
+// all.  The caller has checked that it fits.
+fn put_octal(var buf: Bytes, at: Int, width: Int, value: Int)
+    var v = value
+    var i = width - 2
+    while i >= 0
+        bytes.set_u8(buf, at + i, '0' + v % 8)
+        v = v / 8
+        i = i - 1
+
+// Writes `value` big-endian in two's complement with the top bit of the
+// first byte set, which is how GNU tar stores a number octal cannot.
+fn put_base256(var buf: Bytes, at: Int, width: Int, value: Int)
+    var v = value
+    var i = width - 1
+    while i >= 0
+        bytes.set_u8(buf, at + i, v & 255)
+        v = v >> 8
+        i = i - 1
+    let first = bytes.byte_at(buf, at) ?? 0
+    bytes.set_u8(buf, at, first | 128)
+
+// Writes a numeric field.  A value octal holds goes in as octal; one it
+// does not goes in as base-256 under PAX, where the extended header
+// carries the real number, and is refused under USTAR.
+fn put_number(var buf: Bytes, name: Str, at: Int, width: Int, value: Int,
+              pax: Bool) -> Result<Unit, TarError>
+    var limit = OCTAL_7
+    if width == 12
+        limit = OCTAL_11
+    if value >= 0 and value < limit
+        put_octal(var buf, at, width, value)
+        return Ok(())
+    if not pax or value >= BASE256_LIMIT or value < -BASE256_LIMIT
+        return Err(FieldTooLarge(name, value))
+    put_base256(var buf, at, width, value)
+    Ok(())

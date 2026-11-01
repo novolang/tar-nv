@@ -1,0 +1,360 @@
+// tarheader_wire_tests.nv — the header block on the wire: what `emit`
+// writes, what `parse` accepts, and what each refuses.
+//
+// The blocks are built here byte by byte for the cases no writer in this
+// package produces (a V7 header, a GNU magic, a base-256 number, a bad
+// checksum), and the round trips cover every field of the value.
+
+use std.test
+use tar
+use tarheader
+use tarerror
+
+fn emit_ok(h: TarHeader, f: TarFormat) -> Bytes
+    match tarheader.emit(h, f)
+        Ok(b)  => b
+        Err(e) =>
+            test.fail("emit refused: ${e.message()}")
+            bytes.zeros(512)
+
+fn put(var b: Bytes, at: Int, text: Str)
+    let src = bytes.from_str(text)
+    bytes.copy_into(b, at, src, 0, bytes.len(src))
+
+// A block with its checksum field recomputed from the other fields.
+fn sealed(block: Bytes) -> Bytes
+    var b = bytes.clone(block)
+    bytes.fill(b, 148, 8, 32)
+    let sum = tarheader.checksum(b)
+    let digits = str.pad_left("${octal(sum)}", 6, "0")
+    put(var b, 148, digits)
+    bytes.set_u8(b, 154, 0)
+    bytes.set_u8(b, 155, 32)
+    b
+
+fn octal(n: Int) -> Str
+    if n < 8
+        return "${n}"
+    octal(n / 8) + "${n % 8}"
+
+fn named(name: Str, size: Str) -> Bytes
+    var b = bytes.zeros(512)
+    put(var b, 0, name)
+    put(var b, 100, "0000644")
+    put(var b, 108, "0000000")
+    put(var b, 116, "0000000")
+    put(var b, 124, size)
+    put(var b, 136, "00000000000")
+    bytes.set_u8(b, 156, '0')
+    put(var b, 257, "ustar")
+    put(var b, 263, "00")
+    b
+
+fn parsed(b: Bytes) -> TarHeader
+    match tarheader.parse(b, 0)
+        Ok((h, _)) => h
+        Err(e)     =>
+            test.fail("parse refused: ${e.message()}")
+            tarheader.header("", 0)
+
+@test
+fn test_every_field_survives_a_round_trip() [io]
+    test.case("a file with owner names, a time and an unusual mode")
+    let h0 = tarheader.with_owner_names(tarheader.with_owner(tarheader.with_mtime(tarheader.with_mode(tarheader.header("src/main.nv", 1234), 2541), 1757376000),
+        1000,
+        20),
+    "klaus", "staff")
+    match tarheader.parse(emit_ok(h0, UstarFormat), 7)
+        Ok((h, f)) =>
+            test.assert(h == h0)
+            test.assert(tar.format_name(f) == "ustar")
+        Err(_)     => test.fail("a block this package wrote did not parse")
+
+@test
+fn test_a_device_and_a_link_round_trip() [io]
+    test.case("device numbers, the link target and the kind byte")
+    let dev = TarHeader { path: "dev/null", mode: 438, uid: 0, gid: 0, size: 0, mtime: 5,
+                          kind: TarCharDevice, link: "", uname: "root", gname: "root",
+                          devmajor: 1, devminor: 3 }
+    test.assert(parsed(emit_ok(dev, UstarFormat)) == dev)
+    let link = tarheader.symlink("latest", "v2.tar")
+    test.assert(parsed(emit_ok(link, UstarFormat)) == link)
+    let hard = TarHeader { path: "b", mode: 420, uid: 0, gid: 0, size: 0, mtime: 0,
+                           kind: TarHardLink, link: "a", uname: "", gname: "",
+                           devmajor: 0, devminor: 0 }
+    test.assert(parsed(emit_ok(hard, UstarFormat)) == hard)
+
+@test
+fn test_the_header_bytes_are_the_posix_layout() [io]
+    test.case("the offsets, the digits and the terminators GNU tar writes")
+    let b = emit_ok(tarheader.with_mtime(tarheader.header("a.txt", 6), 1757376000), UstarFormat)
+    test.assert(bytes.to_str(bytes.slice(b, 0, 5)) == "a.txt")
+    test.assert(bytes.to_str(bytes.slice(b, 100, 107)) == "0000644")
+    test.assert(bytes.to_str(bytes.slice(b, 124, 135)) == "00000000006")
+    test.assert(bytes.to_str(bytes.slice(b, 136, 147)) == "15057667000")
+    test.assert((bytes.byte_at(b, 135) ?? 1) == 0)
+    test.assert((bytes.byte_at(b, 154) ?? 1) == 0)
+    test.assert((bytes.byte_at(b, 155) ?? 1) == 32)
+    test.assert(bytes.to_str(bytes.slice(b, 257, 262)) == "ustar")
+    test.assert((bytes.byte_at(b, 262) ?? 1) == 0)
+    test.assert(bytes.to_str(bytes.slice(b, 263, 265)) == "00")
+    test.assert((bytes.byte_at(b, 156) ?? 0) == 48)
+
+@test
+fn test_the_stored_checksum_is_the_sum_with_spaces() [io]
+    test.case("six octal digits, a NUL and a space")
+    let b = emit_ok(tarheader.header("a.txt", 6), UstarFormat)
+    let sum = tarheader.checksum(b)
+    test.assert(bytes.to_str(bytes.slice(b, 148, 154)) == str.pad_left(octal(sum), 6, "0"))
+
+@test
+fn test_the_prefix_joins_the_name() [io]
+    test.case("USTAR's two path fields read back as one path")
+    var b = named("name.txt", "00000000000")
+    put(var b, 345, "some/deep/directory")
+    test.assert(parsed(sealed(b)).path == "some/deep/directory/name.txt")
+
+@test
+fn test_a_gnu_magic_is_read_and_its_prefix_field_is_not_a_path() [io]
+    test.case("GNU keeps other data where POSIX keeps the prefix")
+    var b = named("name.txt", "00000000000")
+    put(var b, 257, "ustar  ")
+    put(var b, 345, "12345")
+    match tarheader.parse(sealed(b), 0)
+        Ok((h, f)) =>
+            test.assert(h.path == "name.txt")
+            test.assert(tar.format_name(f) == "ustar")
+        Err(_)     => test.fail("a GNU header was refused")
+
+@test
+fn test_a_v7_header_has_no_magic_and_no_owner_names() [io]
+    test.case("the layout is read, and what it does not have is empty")
+    var b = named("old.txt", "00000000012")
+    bytes.fill(b, 257, 8, 0)
+    put(var b, 265, "ignored")
+    match tarheader.parse(sealed(b), 0)
+        Ok((h, f)) =>
+            test.assert(tar.format_name(f) == "v7")
+            test.assert(h.size == 10)
+            test.assert(h.uname == "")
+        Err(_)     => test.fail("a V7 header was refused")
+
+@test
+fn test_a_text_block_is_not_a_header() [io]
+    test.case("the magic field decides before the checksum does")
+    var b = bytes.zeros(512)
+    bytes.fill(b, 0, 512, 'x')
+    match tarheader.parse(b, 9)
+        Err(BadUstarMagic(n)) => test.assert(n == 9)
+        _                     => test.fail("text was not refused for its magic")
+
+@test
+fn test_a_wrong_checksum_names_both_sums() [io]
+    test.case("want is what the block adds up to, got is what it says")
+    var b = sealed(named("a", "00000000000"))
+    bytes.set_u8(b, 0, 'b')
+    let want = tarheader.checksum(b)
+    match tarheader.parse(b, 3)
+        Err(BadHeaderChecksum(n, w, g)) =>
+            test.assert(n == 3)
+            test.assert(w == want)
+            test.assert(g == want - 1)
+        _                               => test.fail("a changed byte was not noticed")
+
+@test
+fn test_a_signed_checksum_is_accepted() [io]
+    test.case("1980s writers summed signed characters")
+    var b = named("caf\xc3\xa9", "00000000000")
+    bytes.fill(b, 148, 8, 32)
+    var signed = 0
+    for i in 0..512
+        var v = bytes.byte_at(b, i) ?? 0
+        if v >= 128
+            v = v - 256
+        signed = signed + v
+    put(var b, 148, str.pad_left(octal(signed), 6, "0"))
+    bytes.set_u8(b, 154, 0)
+    bytes.set_u8(b, 155, 32)
+    match tarheader.parse(b, 0)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a signed checksum was refused")
+
+@test
+fn test_a_field_that_is_not_a_number_is_named() [io]
+    test.case("the field and what it held, with the unprintable shown as ?")
+    var b = named("a", "00000000000")
+    put(var b, 100, "07x4")
+    bytes.set_u8(b, 104, 1)
+    match tarheader.parse(sealed(b), 4)
+        Err(BadNumericField(n, field, text)) =>
+            test.assert(n == 4)
+            test.assert(field == "mode")
+            test.assert(text == "07x4?44")
+        _                                    => test.fail("a bad mode was accepted")
+    var c = named("a", "00000000000")
+    put(var c, 148, "zzzzzz")
+    match tarheader.parse(c, 0)
+        Err(BadNumericField(_, field, _)) => test.assert(field == "chksum")
+        _                                 => test.fail("a bad checksum field was accepted")
+
+@test
+fn test_octal_may_have_leading_spaces_and_end_in_a_space() [io]
+    test.case("writers differ in how they pad a number")
+    var b = named("a", "         12 ")
+    bytes.set_u8(b, 135, 0)
+    test.assert(parsed(sealed(b)).size == 10)
+    test.case("a field of nothing is zero")
+    var c = named("a", "")
+    test.assert(parsed(sealed(c)).size == 0)
+
+@test
+fn test_a_size_over_eight_gib_is_base_256_under_pax() [io]
+    test.case("GNU's extension: the top bit set and the number big-endian")
+    let h = tarheader.header("big", 9663676416)
+    match tarheader.emit(h, UstarFormat)
+        Err(FieldTooLarge(field, v)) =>
+            test.assert(field == "size")
+            test.assert(v == 9663676416)
+        _                            => test.fail("USTAR wrote a size it cannot hold")
+    let b = emit_ok(h, PaxFormat)
+    test.assert((bytes.byte_at(b, 124) ?? 0) == 128)
+    test.assert(parsed(b).size == 9663676416)
+
+@test
+fn test_a_negative_time_is_base_256_under_pax() [io]
+    test.case("two's complement, first byte 0xFF")
+    let h = tarheader.with_mtime(tarheader.header("old", 0), -86400)
+    let b = emit_ok(h, PaxFormat)
+    test.assert((bytes.byte_at(b, 136) ?? 0) == 255)
+    test.assert(parsed(b).mtime == -86400)
+    match tarheader.emit(h, UstarFormat)
+        Err(FieldTooLarge(_, _)) => test.assert(true)
+        _                        => test.fail("USTAR wrote a negative time")
+
+@test
+fn test_a_base_256_number_out_of_range_is_refused() [io]
+    test.case("one that would overflow the integer is a bad field, not a wrong size")
+    var b = named("a", "00000000000")
+    bytes.set_u8(b, 124, 128)
+    bytes.set_u8(b, 125, 255)
+    match tarheader.parse(sealed(b), 0)
+        Err(BadNumericField(_, field, _)) => test.assert(field == "size")
+        _                                 => test.fail("a 2^88 size was accepted")
+    test.case("and so is one on the writing side")
+    let h = tarheader.header("huge", 36028797018963968)
+    match tarheader.emit(h, PaxFormat)
+        Err(FieldTooLarge(_, _)) => test.assert(true)
+        _                        => test.fail("a number past 2^55 was written")
+
+@test
+fn test_other_numbers_past_their_field_are_refused_under_ustar() [io]
+    test.case("uid, mode and device numbers have seven digits")
+    let base = tarheader.header("a", 1)
+    match tarheader.emit(tarheader.with_owner(base, 2097152, 0), UstarFormat)
+        Err(FieldTooLarge(f, _)) => test.assert(f == "uid")
+        _                        => test.fail("an eight-digit uid was written")
+    match tarheader.emit(tarheader.with_mode(base, 2097152), UstarFormat)
+        Err(FieldTooLarge(f, _)) => test.assert(f == "mode")
+        _                        => test.fail("an eight-digit mode was written")
+    test.assert(parsed(emit_ok(tarheader.with_owner(base, 2097152, 5000000), PaxFormat)).gid == 5000000)
+
+@test
+fn test_names_over_32_bytes_need_pax() [io]
+    test.case("USTAR refuses, PAX cuts the block's copy and the record has the rest")
+    let long = str.repeat("n", 40)
+    let h = tarheader.with_owner_names(tarheader.header("a", 1), long, "g")
+    match tarheader.emit(h, UstarFormat)
+        Err(FieldTooLarge(f, v)) =>
+            test.assert(f == "uname")
+            test.assert(v == 40)
+        _                        => test.fail("a 40-byte user name was written")
+    test.assert(parsed(emit_ok(h, PaxFormat)).uname == str.repeat("n", 32))
+    let g = tarheader.with_owner_names(tarheader.header("a", 1), "u", long)
+    match tarheader.emit(g, UstarFormat)
+        Err(FieldTooLarge(f, _)) => test.assert(f == "gname")
+        _                        => test.fail("a 40-byte group name was written")
+
+@test
+fn test_a_link_target_over_100_bytes_needs_pax() [io]
+    test.case("it has no prefix field to spill into")
+    let target = str.repeat("t", 101)
+    let h = tarheader.symlink("l", target)
+    match tarheader.emit(h, UstarFormat)
+        Err(PathTooLong(p, cap)) =>
+            test.assert(p == target)
+            test.assert(cap == 100)
+        _                        => test.fail("a 101-byte link target was written")
+    test.assert(str.len(parsed(emit_ok(h, PaxFormat)).link) == 100)
+
+@test
+fn test_the_path_split_follows_gnu_tar() [io]
+    test.case("a path of up to 100 bytes is the name alone")
+    let p100 = str.repeat("a", 100)
+    test.assert(tarheader.fits_ustar(p100))
+    test.case("a longer one splits at the last slash that leaves a prefix of at most 155")
+    let deep = str.repeat("d", 100) + "/" + str.repeat("e", 50) + "/file.txt"
+    test.assert(tarheader.fits_ustar(deep))
+    let b = emit_ok(tarheader.header(deep, 1), UstarFormat)
+    test.assert(bytes.to_str(bytes.slice(b, 0, 8)) == "file.txt")
+    test.assert(parsed(b).path == deep)
+    test.case("the longest path that fits is 155 + a slash + 100")
+    let edge = str.repeat("p", 155) + "/" + str.repeat("n", 100)
+    test.assert(tarheader.fits_ustar(edge))
+    test.assert(parsed(emit_ok(tarheader.header(edge, 1), UstarFormat)).path == edge)
+    test.assert(tarheader.fits_ustar(edge + "x") == false)
+
+@test
+fn test_a_path_with_no_split_is_refused_under_ustar() [io]
+    test.case("a name over 100 bytes with no slash to cut at")
+    let p = str.repeat("a", 101)
+    test.assert(tarheader.fits_ustar(p) == false)
+    match tarheader.emit(tarheader.header(p, 1), UstarFormat)
+        Err(PathTooLong(path, cap)) =>
+            test.assert(path == p)
+            test.assert(cap == 100)
+        _                           => test.fail("a 101-byte name was written")
+    test.case("a prefix over 155 bytes")
+    let q = str.repeat("p", 156) + "/n"
+    test.assert(tarheader.fits_ustar(q) == false)
+    test.case("a path over 256 bytes names that limit")
+    let r = str.repeat("a/", 130)
+    match tarheader.emit(tarheader.header(r, 1), UstarFormat)
+        Err(PathTooLong(_, cap)) => test.assert(cap == 256)
+        _                        => test.fail("a 260-byte path was written")
+    test.case("a name that ends the path in a slash has nothing after it to split on")
+    test.assert(tarheader.fits_ustar(str.repeat("a", 150) + "/") == false)
+
+@test
+fn test_pax_cuts_the_block_copy_of_a_path_it_cannot_split() [io]
+    test.case("the extended header carries the whole path")
+    let p = str.repeat("a", 150)
+    let b = emit_ok(tarheader.header(p, 1), PaxFormat)
+    test.assert(parsed(b).path == str.repeat("a", 100))
+
+@test
+fn test_v7_is_refused_with_a_reason() [io]
+    match tarheader.emit(tarheader.header("a", 1), V7Format)
+        Err(e) => test.assert(str.contains(e.message(), "v7"))
+        Ok(_)  => test.fail("a V7 header was written")
+
+@test
+fn test_checksum_counts_a_short_buffer() [io]
+    test.case("only the bytes there are, with the field's spaces where it reaches")
+    test.assert(tarheader.checksum(bytes.from_str("ab")) == 195)
+    test.assert(tarheader.checksum(bytes.zeros(150)) == 64)
+
+@test
+fn test_hostile_blocks_never_panic() [io]
+    test.case("every byte value in every position of a valid header")
+    let good = emit_ok(tarheader.with_mtime(tarheader.header("a.txt", 6), 99), UstarFormat)
+    var refused = 0
+    for pos in 0..512
+        for v in [0, 1, 32, 47, 55, 56, 127, 128, 255]
+            var b = bytes.clone(good)
+            bytes.set_u8(b, pos, v)
+            match tarheader.parse(b, 0)
+                Ok(_)  =>
+                    refused = refused + 0
+                Err(_) =>
+                    refused = refused + 1
+    test.assert(refused > 0)
