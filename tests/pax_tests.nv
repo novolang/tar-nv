@@ -4,13 +4,12 @@
 // an interface package ships a failing suite.
 //
 // The assertions worth writing here are all about the self-counting
-// length.  `"path=x"` is six bytes, plus a newline is seven, plus a
-// space is eight, plus the digits of the total — and the total is 10,
-// which is two digits, so the record is ten bytes and the naive
-// answer of nine is wrong.  A writer that computes the length without
-// counting its own digits works for short values and fails at the
-// 9-to-10 boundary, which is exactly the bug this suite is here to
-// catch the day a body lands.
+// length.  `path=x` is six bytes, the newline makes seven, the space
+// eight, and the one digit that says so makes nine: `9 path=x\n`.  The
+// length is not always one digit more than the rest: at the boundary
+// where adding the digits carries into a longer number the record has to
+// count the longer number, and a writer that does not works for short
+// values and fails for long ones.
 
 use std.test
 use pax
@@ -25,8 +24,8 @@ fn test_a_record_keeps_its_key_and_value() [io]
 
 @test
 fn test_the_length_prefix_counts_itself() [io]
-    test.case("`10 path=x\\n` is ten bytes including the two digits of 10")
-    test.assert(pax.records_size([pax.record("path", "x")]) == 10)
+    test.case("`9 path=x\\n` is nine bytes including the digit 9")
+    test.assert(pax.records_size([pax.record("path", "x")]) == 9)
 
 @test
 fn test_the_length_survives_the_nine_to_ten_boundary() [io]

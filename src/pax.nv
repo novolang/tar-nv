@@ -8,11 +8,11 @@
 //     "%d %s=%s\n" % (total_length, key, value)
 //
 // where `total_length` counts ITSELF.  That self-reference is the
-// whole trick and the whole trap: `30 mtime=1757376000.5\n` is
-// thirty bytes including the two digits of "30", so a writer that
+// whole trick and the whole trap: `22 mtime=1757376000.5\n` is
+// twenty-two bytes including the two digits of "22", so a writer that
 // computes the length without them produces a record every reader
 // rejects, and one that gets it wrong by a digit at the 9-to-10
-// boundary produces a record that works for short values and fails
+// boundary (where a length of 98 becomes 101) produces a record that works for short values and fails
 // for long ones.  `emit_records` computes it correctly, once, and
 // that is the main reason this module exists rather than being three
 // lines at a call site.
@@ -41,6 +41,7 @@
 // got.
 
 use tarheader
+use tarerror
 
 // One `key=value` record from an extended header.
 //
@@ -67,7 +68,7 @@ pub struct PaxRecord
 //     println("${pax.record("size", "8589934592").value}")
 // ```
 pub fn record(key: Str, value: Str) -> PaxRecord
-    todo("tar-nv.pax.record")
+    PaxRecord { key: key, value: value }
 
 // Parse the data blocks of an extended header into records.
 //
@@ -90,7 +91,34 @@ pub fn record(key: Str, value: Str) -> PaxRecord
 //         Err(_) => println("malformed")
 // ```
 pub fn parse_records(data: Bytes, block: Int) -> Result<[PaxRecord], TarError>
-    todo("tar-nv.pax.parse_records")
+    var out: [PaxRecord] = []
+    let n = bytes.len(data)
+    var at = 0
+    while at < n
+        var digits = 0
+        var len = 0
+        while at + digits < n and digits < 19 and is_digit(bytes.byte_at(data, at + digits) ?? 0)
+            len = len * 10 + ((bytes.byte_at(data, at + digits) ?? 0) - '0')
+            digits = digits + 1
+        if digits == 0 or digits == 19
+            return Err(BadPaxRecord(block, "a record does not start with a decimal length"))
+        if (bytes.byte_at(data, at + digits) ?? 0) != ' '
+            return Err(BadPaxRecord(block, "the length is not followed by a space"))
+        if len < digits + 4 or at + len > n
+            return Err(BadPaxRecord(block, "the length ${len} does not fit the record"))
+        if (bytes.byte_at(data, at + len - 1) ?? 0) != '\n'
+            return Err(BadPaxRecord(block, "a record does not end in a newline"))
+        let body = bytes.slice(data, at + digits + 1, at + len - 1)
+        let eq = bytes.find_byte(body, '=', 0) ?? -1
+        if eq <= 0
+            return Err(BadPaxRecord(block, "a record has no key before its '='"))
+        let key = bytes.to_str(bytes.slice(body, 0, eq))
+        let value = bytes.to_str(bytes.slice(body, eq + 1, bytes.len(body)))
+        if not value_is_well_formed(key, value)
+            return Err(BadPaxRecord(block, "the value of ${key} is not a number"))
+        list.push(out, PaxRecord { key: key, value: value })
+        at = at + len
+    Ok(out)
 
 // Records as the bytes of an extended header's payload.
 //
@@ -102,10 +130,17 @@ pub fn parse_records(data: Bytes, block: Int) -> Result<[PaxRecord], TarError>
 //
 // fn main() [io]
 //     let b = pax.emit_records([pax.record("path", "x")])
-//     println("${bytes.len(b)}")                           // 13
+//     println("${bytes.len(b)}")                           // 9
 // ```
 pub fn emit_records(rs: [PaxRecord]) -> Bytes
-    todo("tar-nv.pax.emit_records")
+    var out = bytes.zeros(records_size(rs))
+    var at = 0
+    for r in rs
+        let n = record_length(r)
+        let line = bytes.from_str("${n} ${r.key}=${r.value}\n")
+        bytes.copy_into(out, at, line, 0, n)
+        at = at + n
+    out
 
 // The value for a key, with POSIX's last-one-wins rule applied.
 //
@@ -123,7 +158,11 @@ pub fn emit_records(rs: [PaxRecord]) -> Bytes
 //         None    => println("absent")
 // ```
 pub fn lookup(rs: [PaxRecord], key: Str) -> ?Str
-    todo("tar-nv.pax.lookup")
+    var found: ?Str = None
+    for r in rs
+        if r.key == key
+            found = Some(r.value)
+    found
 
 // The records a header needs in order to be written without loss.
 //
@@ -144,7 +183,24 @@ pub fn lookup(rs: [PaxRecord], key: Str) -> ?Str
 //     println("${list.len(pax.records_for(tarheader.header("a.txt", 10)))}")  // 0
 // ```
 pub fn records_for(h: TarHeader) -> [PaxRecord]
-    todo("tar-nv.pax.records_for")
+    var out: [PaxRecord] = []
+    if not tarheader.fits_ustar(h.path)
+        list.push(out, PaxRecord { key: "path", value: h.path })
+    if str.len(h.link) > 100
+        list.push(out, PaxRecord { key: "linkpath", value: h.link })
+    if h.size >= OCTAL_11 or h.size < 0
+        list.push(out, PaxRecord { key: "size", value: "${h.size}" })
+    if h.uid >= OCTAL_7 or h.uid < 0
+        list.push(out, PaxRecord { key: "uid", value: "${h.uid}" })
+    if h.gid >= OCTAL_7 or h.gid < 0
+        list.push(out, PaxRecord { key: "gid", value: "${h.gid}" })
+    if str.len(h.uname) > 32
+        list.push(out, PaxRecord { key: "uname", value: h.uname })
+    if str.len(h.gname) > 32
+        list.push(out, PaxRecord { key: "gname", value: h.gname })
+    if h.mtime >= OCTAL_11 or h.mtime < 0
+        list.push(out, PaxRecord { key: "mtime", value: "${h.mtime}" })
+    out
 
 // A header with a set of records applied over it.
 //
@@ -165,7 +221,52 @@ pub fn records_for(h: TarHeader) -> [PaxRecord]
 //     println(h.path)                                      // much/longer
 // ```
 pub fn apply(h: TarHeader, rs: [PaxRecord]) -> TarHeader
-    todo("tar-nv.pax.apply")
+    var name = h.path
+    var link = h.link
+    var size = h.size
+    var mtime = h.mtime
+    var uid = h.uid
+    var gid = h.gid
+    var uname = h.uname
+    var gname = h.gname
+    match effective(rs, "path")
+        Some(v) =>
+            name = v
+        None    => 0
+    match effective(rs, "linkpath")
+        Some(v) =>
+            link = v
+        None    => 0
+    match effective(rs, "uname")
+        Some(v) =>
+            uname = v
+        None    => 0
+    match effective(rs, "gname")
+        Some(v) =>
+            gname = v
+        None    => 0
+    match number_of(rs, "size")
+        Some(v) =>
+            size = v
+        None    => 0
+    match number_of(rs, "uid")
+        Some(v) =>
+            uid = v
+        None    => 0
+    match number_of(rs, "gid")
+        Some(v) =>
+            gid = v
+        None    => 0
+    match effective(rs, "mtime")
+        Some(v) =>
+            match seconds_of(v)
+                Some(t) =>
+                    mtime = t
+                None    => 0
+        None    => 0
+    TarHeader { path: name, mode: h.mode, uid: uid, gid: gid, size: size, mtime: mtime,
+                kind: h.kind, link: link, uname: uname, gname: gname,
+                devmajor: h.devmajor, devminor: h.devminor }
 
 // The size in bytes an extended header's payload will occupy.
 //
@@ -178,7 +279,144 @@ pub fn apply(h: TarHeader, rs: [PaxRecord]) -> TarHeader
 // use pax
 //
 // fn main() [io]
-//     println("${pax.records_size([pax.record("path", "x")])}")   // 13
+//     println("${pax.records_size([pax.record("path", "x")])}")   // 9
 // ```
 pub fn records_size(rs: [PaxRecord]) -> Int
-    todo("tar-nv.pax.records_size")
+    var total = 0
+    for r in rs
+        total = total + record_length(r)
+    total
+
+// The largest values the octal fields of a header block hold, plus one:
+// seven digits for uid and gid, eleven for size and mtime.
+const OCTAL_7 = 2097152
+const OCTAL_11 = 8589934592
+
+// The keys `apply` copies into a header, which `unapplied` therefore
+// leaves out.
+fn is_applied(key: Str) -> Bool
+    key == "path" or key == "linkpath" or key == "size" or key == "uid"
+        or key == "gid" or key == "uname" or key == "gname"
+
+// The records `apply` does not copy into a header: vendor keys, the
+// times a header does not hold, and an `mtime` whose fraction a header
+// cannot keep.  In their original order.
+//
+// ```novo
+// use pax
+//
+// fn main() [io]
+//     let rs = [pax.record("path", "x"), pax.record("comment", "hi")]
+//     println("${list.len(pax.unapplied(rs))}")            // 1
+// ```
+pub fn unapplied(rs: [PaxRecord]) -> [PaxRecord]
+    var out: [PaxRecord] = []
+    for r in rs
+        if is_applied(r.key)
+            continue
+        if r.key == "mtime" and not str.contains(r.value, ".")
+            continue
+        list.push(out, r)
+    out
+
+fn is_digit(b: Int) -> Bool
+    b >= '0' and b <= '9'
+
+// The bytes one record occupies: its length counts its own digits, so
+// the digit count is found by trying one more digit until it settles.
+fn record_length(r: PaxRecord) -> Int
+    let rest = str.len(r.key) + str.len(r.value) + 3
+    var digits = 1
+    while digits_in(rest + digits) > digits
+        digits = digits + 1
+    rest + digits
+
+fn digits_in(n: Int) -> Int
+    var d = 1
+    var v = n
+    while v >= 10
+        v = v / 10
+        d = d + 1
+    d
+
+// The last value for a key, ignoring an empty one: an empty value
+// withdraws what a global header set, which leaves the header's own.
+fn effective(rs: [PaxRecord], key: Str) -> ?Str
+    match lookup(rs, key)
+        Some(v) =>
+            if str.len(v) == 0
+                return None
+            Some(v)
+        None    => None
+
+fn number_of(rs: [PaxRecord], key: Str) -> ?Int
+    match effective(rs, key)
+        Some(v) => decimal(v)
+        None    => None
+
+// A non-negative decimal number of at most 18 digits.
+fn decimal(text: Str) -> ?Int
+    let n = str.len(text)
+    if n == 0 or n > 18
+        return None
+    var value = 0
+    for i in 0..n
+        let b = str.byte_at(text, i) ?? 0
+        if not is_digit(b)
+            return None
+        value = value * 10 + (b - '0')
+    Some(value)
+
+// Whole seconds of a decimal time with an optional sign and fraction,
+// rounded toward minus infinity.
+fn seconds_of(text: Str) -> ?Int
+    var body = text
+    var negative = false
+    if str.starts_with(body, "-")
+        negative = true
+        body = str.slice(body, 1, str.len(body))
+    var whole = body
+    var fraction = ""
+    match str.index(body, ".")
+        Some(dot) =>
+            whole = str.slice(body, 0, dot)
+            fraction = str.slice(body, dot + 1, str.len(body))
+        None      => 0
+    var seconds = 0
+    match decimal(whole)
+        Some(v) =>
+            seconds = v
+        None    =>
+            return None
+    if not negative
+        return Some(seconds)
+    if str.len(fraction) > 0 and fraction != str.repeat("0", str.len(fraction))
+        return Some(-seconds - 1)
+    Some(-seconds)
+
+// Whether a record's value suits its key: the numeric keys must hold
+// numbers, or nothing.
+fn value_is_well_formed(key: Str, value: Str) -> Bool
+    if str.len(value) == 0
+        return true
+    if key == "size" or key == "uid" or key == "gid"
+        return decimal(value) != None
+    if key == "mtime" or key == "atime" or key == "ctime"
+        return time_is_well_formed(value)
+    true
+
+fn time_is_well_formed(text: Str) -> Bool
+    var body = text
+    if str.starts_with(body, "-")
+        body = str.slice(body, 1, str.len(body))
+    match str.index(body, ".")
+        Some(dot) =>
+            let frac = str.slice(body, dot + 1, str.len(body))
+            let whole = str.slice(body, 0, dot)
+            if str.len(frac) == 0 or str.len(whole) == 0
+                return false
+            for i in 0..str.len(frac)
+                if not is_digit(str.byte_at(frac, i) ?? 0)
+                    return false
+            decimal(whole) != None
+        None      => decimal(body) != None

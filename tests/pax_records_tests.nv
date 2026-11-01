@@ -1,0 +1,157 @@
+// pax_records_tests.nv — the extended-header records: how each one is
+// parsed, refused, and applied to a header.
+
+use std.test
+use pax
+use tarerror
+use tarheader
+
+fn rec(text: Str) -> Result<[PaxRecord], TarError>
+    pax.parse_records(bytes.from_str(text), 5)
+
+fn refused(text: Str, why: Str)
+    match rec(text)
+        Err(BadPaxRecord(b, reason)) =>
+            test.assert(b == 5)
+            test.assert(str.contains(reason, why))
+        _                            => test.fail("accepted: ${text}")
+
+fn applied(rs: [PaxRecord]) -> TarHeader
+    pax.apply(tarheader.header("old", 7), rs)
+
+@test
+fn test_a_malformed_record_says_what_is_wrong() [io]
+    test.case("no length")
+    refused("path=x\n", "decimal length")
+    test.case("a length too long for an integer")
+    refused("1234567890123456789 path=x\n", "decimal length")
+    test.case("no space after the length")
+    refused("9path=xxx\n", "followed by a space")
+    test.case("a length shorter than its own text")
+    refused("3 a=b\n", "does not fit")
+    test.case("a length past the end of the data")
+    refused("99 path=x\n", "does not fit")
+    test.case("no newline at the end")
+    refused("9 path=xx", "newline")
+    test.case("no key")
+    refused("6 =ab\n", "key")
+    test.case("a size that is not a number")
+    refused("12 size=12x\n", "size")
+    test.case("a time that is not a number")
+    refused("12 mtime=x1\n", "mtime")
+
+@test
+fn test_numeric_values_are_checked_by_key() [io]
+    test.case("an empty value passes: it withdraws a global")
+    match rec("8 size=\n")
+        Ok(rs) => test.assert(list.len(rs) == 1)
+        Err(_) => test.fail("an empty size was refused")
+    test.case("times may be negative or fractional")
+    for v in ["-5", "100.25", "-1.5", "7"]
+        match rec(pax.emit_records([pax.record("mtime", v)]) |> bytes.to_str)
+            Ok(_)  => test.assert(true)
+            Err(_) => test.fail("refused the time ${v}")
+    test.case("but not malformed")
+    for v in ["1.", ".5", "1.x", "a", "-"]
+        match rec(bytes.to_str(pax.emit_records([pax.record("atime", v)])))
+            Err(_) => test.assert(true)
+            Ok(_)  => test.fail("accepted the time ${v}")
+    test.case("a key with no rule takes anything")
+    match rec(bytes.to_str(pax.emit_records([pax.record("VENDOR.x", "not a number")])))
+        Ok(rs) => test.assert(rs[0].value == "not a number")
+        Err(_) => test.fail("a vendor key was refused")
+
+@test
+fn test_records_are_returned_in_order_with_repeats() [io]
+    let text = bytes.to_str(pax.emit_records([pax.record("a", "1"), pax.record("b", "2"), pax.record("a", "3")]))
+    match rec(text)
+        Ok(rs) =>
+            test.assert(list.len(rs) == 3)
+            test.assert(rs[2].value == "3")
+        Err(_) => test.fail("three records did not parse")
+
+@test
+fn test_a_value_may_hold_equals_signs_and_newlines() [io]
+    test.case("the length is what ends a record")
+    let rs = [pax.record("comment", "a=b\nc=d")]
+    match pax.parse_records(pax.emit_records(rs), 0)
+        Ok(back) => test.assert(back[0].value == "a=b\nc=d")
+        Err(_)   => test.fail("a multi-line value did not round trip")
+
+@test
+fn test_the_length_counts_itself_across_every_digit_boundary() [io]
+    test.case("values that put the total at 8, 9, 10, 11, 98, 99, 100 and 101 bytes")
+    for n in 1..300
+        let r = [pax.record("k", str.repeat("v", n))]
+        let data = pax.emit_records(r)
+        test.assert(pax.records_size(r) == bytes.len(data))
+        match pax.parse_records(data, 0)
+            Ok(back) => test.assert(back[0].value == str.repeat("v", n))
+            Err(_)   => test.fail("a record of ${n} value bytes did not parse")
+
+@test
+fn test_apply_takes_every_key_it_understands() [io]
+    let h = applied([pax.record("path", "new/path"), pax.record("linkpath", "target"),
+                     pax.record("size", "9663676416"), pax.record("uid", "5000000"),
+                     pax.record("gid", "6000000"), pax.record("uname", "someone"),
+                     pax.record("gname", "somegroup"), pax.record("mtime", "1757376000.75")])
+    test.assert(h.path == "new/path")
+    test.assert(h.link == "target")
+    test.assert(h.size == 9663676416)
+    test.assert(h.uid == 5000000)
+    test.assert(h.gid == 6000000)
+    test.assert(h.uname == "someone")
+    test.assert(h.gname == "somegroup")
+    test.assert(h.mtime == 1757376000)
+
+@test
+fn test_apply_ignores_an_empty_value_and_a_bad_number() [io]
+    test.case("an empty record withdraws a global, which leaves the header's own")
+    let h = applied([pax.record("path", "new"), pax.record("path", "")])
+    test.assert(h.path == "old")
+    test.case("apply does not trust numbers the way parse_records checks them")
+    let g = applied([pax.record("size", "12x"), pax.record("uid", ""), pax.record("mtime", "x"),
+                     pax.record("gid", "1234567890123456789")])
+    test.assert(g.size == 7)
+    test.assert(g.uid == 0)
+    test.assert(g.mtime == 0)
+    test.assert(g.gid == 0)
+
+@test
+fn test_a_fractional_time_rounds_toward_minus_infinity() [io]
+    test.assert(applied([pax.record("mtime", "10.5")]).mtime == 10)
+    test.assert(applied([pax.record("mtime", "10.000")]).mtime == 10)
+    test.assert(applied([pax.record("mtime", "-10")]).mtime == -10)
+    test.assert(applied([pax.record("mtime", "-10.5")]).mtime == -11)
+    test.assert(applied([pax.record("mtime", "-10.00")]).mtime == -10)
+
+@test
+fn test_records_for_names_each_field_that_overflows() [io]
+    let long = str.repeat("x", 300)
+    let h = TarHeader { path: long, mode: 420, uid: 2097152, gid: 2097152, size: 8589934592,
+                        mtime: 8589934592, kind: TarSymlink, link: str.repeat("l", 101),
+                        uname: str.repeat("u", 33), gname: str.repeat("g", 33),
+                        devmajor: 0, devminor: 0 }
+    let rs = pax.records_for(h)
+    var keys: [Str] = []
+    for r in rs
+        list.push(keys, r.key)
+    test.assert_eq(keys, ["path", "linkpath", "size", "uid", "gid", "uname", "gname", "mtime"])
+    test.case("a negative time or size is also beyond octal")
+    let n = tarheader.with_mtime(tarheader.header("a", 1), -5)
+    test.assert(list.len(pax.records_for(n)) == 1)
+    let s = TarHeader { path: "a", mode: 420, uid: 0, gid: 0, size: -1, mtime: 0, kind: TarFile,
+                        link: "", uname: "", gname: "", devmajor: 0, devminor: 0 }
+    test.assert(list.len(pax.records_for(s)) == 1)
+    test.case("a header that fits needs none")
+    test.assert(list.len(pax.records_for(tarheader.header("a/b", 8589934591))) == 0)
+
+@test
+fn test_unapplied_keeps_what_a_header_cannot_hold() [io]
+    let rs = [pax.record("path", "p"), pax.record("mtime", "5"), pax.record("mtime", "5.5"),
+              pax.record("atime", "6"), pax.record("comment", "c"), pax.record("size", "9")]
+    let left = pax.unapplied(rs)
+    test.assert(list.len(left) == 3)
+    test.assert(left[0].value == "5.5")
+    test.assert(left[1].key == "atime")
+    test.assert(left[2].key == "comment")
