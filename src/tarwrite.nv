@@ -31,7 +31,7 @@
 // Because it is a compatibility decision, and only the caller knows
 // who is reading.  `PaxFormat` has no limits and is what every tool
 // since about 2003 reads; `UstarFormat` is what a very old reader
-// wants and refuses a path over 255 bytes or a file over 8 GiB. Under
+// wants and refuses a path over 256 bytes or a file over 8 GiB. Under
 // PAX the writer emits the extended-header entry itself when a field
 // needs one — the caller never builds an `x` entry by hand.
 //
@@ -163,9 +163,12 @@ pub fn write_header(w: TarWriter, h: TarHeader) -> Result<(TarWriter, Bytes), Ta
 // caller streaming a 4 GiB file through it never holds more than its
 // own chunk.  An empty chunk is legal and produces nothing.
 //
-// Anything past the size the header declared is refused rather than
-// truncated: silently dropping it would produce an archive that reads
-// cleanly and is missing data, which is the worst outcome available.
+// A chunk that would take the entry past the size the header declared
+// is not written at all, and `end_entry` then answers `FieldTooLarge`.
+// The call has no error to return, and cutting the chunk short would
+// produce an archive that reads cleanly and is missing data, which is
+// the worst outcome available.  Data given while no entry is open is not
+// written either.
 //
 // ```novo
 // use tarwrite
