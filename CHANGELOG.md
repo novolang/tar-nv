@@ -57,6 +57,8 @@ changes listed below.
 - The manifest is `experimental`, and the README no longer says the
   package is interface only.
 
+This release requires novo 0.23.0 or later.
+
 ## 0.0.3 — 2026-09-12
 
 ### Changed — The README is rewritten in plain technical-writer prose; no signature changed.
